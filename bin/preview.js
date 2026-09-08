@@ -187,13 +187,22 @@ async function contentPoller(stop) {
     const cur = scanContentState();
     if (base === null) {
       if (first) {
-        // 启动对齐：先全量导入 content 页面，避免“启动前已改却未导入”漏导（幂等，未变自动跳过）
+        // 启动对齐：全量导入 content 的页面与图片，避免“启动前已改却未导入”漏导
+        // （页面/图片都幂等：未变自动跳过）
         first = false;
-        const pages = Object.keys(cur).filter((r) => r.endsWith('.mw'))
-          .map((r) => path.join(CONTENT, ...r.split('/')));
+        const pages = [], imgs = [];
+        for (const rel of Object.keys(cur)) {
+          const abs = path.join(CONTENT, ...rel.split('/'));
+          if (rel.endsWith('.mw')) pages.push(abs);
+          else if (rel.startsWith('images/')) imgs.push(abs);
+        }
         if (pages.length) {
           console.log(`启动对齐：导入 content 页面 ${pages.length} 个（未变自动跳过）...`);
           importContentPages(pages);
+        }
+        if (imgs.length) {
+          console.log(`启动对齐：导入 content 图片 ${imgs.length} 个（未变自动跳过）...`);
+          importImagesFrom(imgs);
         }
       }
       base = cur;

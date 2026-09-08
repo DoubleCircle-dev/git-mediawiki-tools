@@ -13,7 +13,8 @@
     "mw-sync": "bin/sync.js",
     "mw-publish": "bin/publish.js",
     "mw-set-pass": "bin/set-pass.js",
-    "mw-content-sync": "bin/content-sync.js"
+    "mw-content-sync": "bin/content-sync.js",
+    "mw-preview": "bin/preview.js"
   },
   "engines": {
     "node": ">=16"

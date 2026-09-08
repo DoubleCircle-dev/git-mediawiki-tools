@@ -20,5 +20,17 @@
   ],
   "defaultUser": "",
   "jsonContentModels": false,
-  "timeoutMs": 180000
+  "timeoutMs": 180000,
+  "_本地预览(可选)": "下面 preview.* 供 bin/preview.js 使用：本地装一套 MediaWiki(php -S+SQLite) 后，把 .mw 导入预览、保存即刷新；exit 自动精简历史。不需要可整段留空。",
+  "preview": {
+    "enabled": false,
+    "mediawikiDir": "/opt/mediawiki",
+    "phpBin": "php",
+    "port": 8080,
+    "adminUser": "Admin",
+    "importSummary": "本地同步",
+    "dbFile": "",
+    "imageStage": "",
+    "noBackfill": false
+  }
 }

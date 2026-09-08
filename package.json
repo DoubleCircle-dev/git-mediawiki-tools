@@ -1,0 +1,33 @@
+{
+  "name": "git-mediawiki-tools",
+  "version": "1.0.0",
+  "description": "用 git 管理 MediaWiki 页面：git-mediawiki 同步/发布 + content/ 目录化内容树双向映射",
+  "keywords": [
+    "mediawiki",
+    "git-mediawiki",
+    "wiki",
+    "git"
+  ],
+  "license": "MIT",
+  "bin": {
+    "mw-sync": "bin/sync.js",
+    "mw-publish": "bin/publish.js",
+    "mw-set-pass": "bin/set-pass.js",
+    "mw-content-sync": "bin/content-sync.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "sync": "node bin/sync.js",
+    "publish": "node bin/publish.js",
+    "status": "node bin/content-sync.js status"
+  }
+}

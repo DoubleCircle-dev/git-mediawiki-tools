@@ -1,0 +1,24 @@
+{
+  "_说明": "git-mediawiki 工具配置。复制本文件为 config.json 后按需修改；留空字段走内置默认。",
+  "wikiName": "mywiki",
+  "wikiBaseUrl": "https://your.wiki.example/",
+  "apiUrl": "https://your.wiki.example/api.php",
+  "remote": "origin",
+  "pushOrder": ["origin"],
+  "wikiRepo": "wiki.mywiki",
+  "contentDir": "content",
+  "namespaces": [
+    "Talk", "User", "User_talk",
+    "Project", "Project_talk",
+    "File", "File_talk",
+    "MediaWiki", "MediaWiki_talk",
+    "Template", "Template_talk",
+    "Help", "Help_talk",
+    "Category", "Category_talk",
+    "Widget", "Widget_talk",
+    "Module", "Module_talk"
+  ],
+  "defaultUser": "",
+  "jsonContentModels": false,
+  "timeoutMs": 180000
+}

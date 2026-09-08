@@ -1,0 +1,12 @@
+# 本机配置（含 wiki 路径/远程名等，勿提交）
+config.json
+
+# Node / 系统
+node_modules/
+npm-debug.log*
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

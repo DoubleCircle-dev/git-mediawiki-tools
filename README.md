@@ -104,6 +104,30 @@ node bin/sync.js
 
 可选的开发体验：在本地建立起一套轻量 MediaWiki，把扁平仓库的 `.mw` 导入其中，改完立刻刷新看渲染、不打扰线上——尤其适合调模板 / TemplateStyles / Lua。本仓库提供 Node 版预览模块 `bin/preview.js`（MediaWiki 本体仍需 PHP 运行，Node 负责启停/监听/导入/精简）：
 
+### 安装本地 MediaWiki
+
+本地预览需要先装一套 MediaWiki。前置：**PHP ≥ 7.4**（建议 8.x，需 `pdo_sqlite`、`curl`、`mbstring`、`xml` 等）、**Composer**、**Git**。
+
+1. **获取 MediaWiki**：官方 [releases.wikimedia.org](https://releases.wikimedia.org/mediawiki/)，或 GitHub 镜像 [wikimedia/mediawiki](https://github.com/wikimedia/mediawiki) 的 codeload tarball（如 `…/tar.gz/refs/heads/REL1_46`）解压到目录。
+2. **安装 PHP 依赖**（tarball 不含 vendor/）：
+   ```bash
+   composer install --no-dev
+   # root 运行时需：COMPOSER_ALLOW_SUPERUSER=1
+   # composer 因安全通告阻断：composer config policy.advisories.block false
+   ```
+3. **生成配置与数据库**（SQLite 库放 `data/`）：
+   ```bash
+   mkdir data
+   php maintenance/install.php --dbtype=sqlite --dbpath=data \
+     --pass='管理员密码' --scriptpath='' Admin
+   ```
+4. **加配置并起预览服务**（`LocalSettings.php` 加 `$wgParserCacheType = CACHE_NONE;` 保证实时渲染）：
+   ```bash
+   php -S 127.0.0.1:8080
+   ```
+5. **按需加扩展 / 皮肤**：目录放进 `extensions/` / `skins/`，在 `LocalSettings.php` 用 `wfLoadExtension('…')` / `wfLoadSkin('…')` 显式加载。
+6. **clone 本地（可选，如果仅本地测试wiki编辑）**：`git clone "mediawiki::http://127.0.0.1:8080/" wiki.mywiki`，并在 `.git/config` 配好凭据与命名空间。
+
 ```bash
 # 需在 config.json 配置 preview.*（mediawikiDir / dbFile 等）
 # 仓库根目录下可直接用 npm scripts：

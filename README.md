@@ -85,8 +85,8 @@ node bin/sync.js
 | `node bin/sync.js [远程]` | 拉取远程（缺省主 remote）并变基、整理进 content/ |
 | `node bin/set-pass.js [用户]` | 设置登录凭据（写入 `remote.<remote>.mwlogin/mwpassword`） |
 | `node bin/content-sync.js status` | 查看两侧差异（`!` = 冲突） |
-| `node bin/content-sync.js mirror` | 扁平仓库 → 内容树（首次初始化） |
-| `node bin/content-sync.js flatten` | 内容树 → 扁平仓库（一般 publish 已自动做） |
+| `node bin/content-sync.js mirror` | 扁平仓库 → 内容树（首次初始化）；**会回退 content/ 侧本地改动时先警告并要求 `--force`** |
+| `node bin/content-sync.js flatten` | 内容树 → 扁平仓库（一般 publish 已自动做）；**会覆盖扁平仓库未提交改动时先警告并要求 `--force`** |
 | `node bin/content-sync.js check` | 往返一致性自检 |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
 | `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史 |
@@ -94,6 +94,15 @@ node bin/sync.js
 也可 `npm link` 后用全局命令 `mw-publish` / `mw-sync` / `mw-content-sync` / `mw-preview` 等。
 
 ## 内容树约定
+
+两个方向都是「**整体以某一侧为准**」的单向复制，不会自动合并：
+
+- `mirror`（扁平仓库 → 内容树）：以扁平仓库（线上）为准刷新内容树；
+- `flatten`（内容树 → 扁平仓库）：以内容树为准回写扁平仓库（**不删除**页面）。
+
+因此两者都可能覆盖对侧同名文件的改动（含未提交改动）。CLI 会在覆盖前列出清单并要求
+`--force`（不加则中止），同一份状态里连着跑两个方向也看不出干净结果——要合并两侧改动请用
+`status` → `conflicts`/`diff` → `resolve` → `publish` 这条流程。
 
 - `content/pages/`：主命名空间页面（无前缀）。
 - `content/<命名空间>/`：各命名空间目录；标题里的 `/` 用真实子目录表示。

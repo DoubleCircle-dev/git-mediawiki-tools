@@ -697,6 +697,86 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
 }
 
 // ---------------------------------------------------------------------------
+// 「会被覆盖」预检
+// mirror / flatten 都是「整体以某一侧为准」的单向覆盖，这里先算出哪些文件会被改写：
+//   analyzeMirror ：mirror 把【扁平仓库】写进 content/ —— content 侧有本地改动就会被回退
+//   analyzeFlatten：flatten 把【内容树】写进扁平仓库 —— 扁平侧有未提交改动就会被覆盖
+// 供 CLI 打印警告并在未加 --force 时中止（避免静默覆盖）。
+// ---------------------------------------------------------------------------
+const OVERWRITE_LABEL = {
+  'content-dirty': 'content/ 侧本地改动会被回退',
+  'both-changed': '两侧各自改（冲突）',
+  'untracked': 'HEAD 里无此页，无法判断哪侧更新',
+  'flat-dirty': '扁平仓库有未提交改动，会被覆盖',
+};
+
+// 该文件相对 HEAD 的改动情况：false=与 HEAD 相同；true=改过；'new'=HEAD 里没有
+function localEdited(repo, name, currentSha) {
+  const head = sha1Head(repo, name);
+  if (head === null) return 'new';
+  return head === currentSha ? false : true;
+}
+
+// mirror 将覆盖 content/ 的文件清单
+function analyzeMirror(flatDir, contentDir) {
+  const { byFlat } = contentNameMap(contentDir);
+  const flat = listFlat(flatDir);
+  const names = flat.mw.concat(flat.images).sort();
+  const overwrite = [];
+  let create = 0, update = 0, unchanged = 0;
+  for (const name of names) {
+    const fPath = path.join(flatDir, name);
+    const rel = byFlat.get(name);
+    const cPath = rel ? path.join(contentDir, rel) : null;
+    if (!cPath || !fs.existsSync(cPath)) { create++; continue; }
+    const F = sha1File(fPath);
+    const C = sha1File(cPath);
+    if (F === C) { unchanged++; continue; }
+    update++;
+    const cEdited = localEdited(flatDir, name, C);
+    if (cEdited === false) continue;              // content 侧没动过 → 只是把扁平侧更新拉下来，安全
+    const fEdited = localEdited(flatDir, name, F);
+    let kind;
+    if (fEdited === true || fEdited === 'new') kind = 'both-changed';
+    else if (cEdited === 'new') kind = 'untracked';
+    else kind = 'content-dirty';
+    overwrite.push({ name, rel, kind });
+  }
+  return { create, update, unchanged, overwrite };
+}
+
+// flatten 将覆盖扁平仓库的文件清单（扁平侧有未提交改动 / 未跟踪新增）
+function analyzeFlatten(flatDir, contentDir, repo) {
+  const { byFlat } = contentNameMap(contentDir);
+  const dirty = gitDirty(repo || flatDir);
+  const overwrite = [];
+  for (const [flat, rel] of [...byFlat.entries()].sort()) {
+    const cPath = path.join(contentDir, rel);
+    const fPath = path.join(flatDir, flat);
+    if (!fs.existsSync(cPath) || !fs.existsSync(fPath)) continue;   // 新建不算覆盖
+    if (sha1File(cPath) === sha1File(fPath)) continue;
+    if (dirty.has(flat)) overwrite.push({ name: flat, rel, kind: 'flat-dirty' });
+  }
+  return { overwrite };
+}
+
+// 打印覆盖警告；返回 true 表示“需要 --force 才能继续”
+function warnOverwrite(title, overwrite, force) {
+  if (!overwrite.length) return false;
+  console.log(`⚠️ ${title}，会覆盖 ${overwrite.length} 处：`);
+  for (const o of overwrite.slice(0, 10)) {
+    console.log(`   - ${o.name}（${OVERWRITE_LABEL[o.kind] || o.kind}）`);
+  }
+  if (overwrite.length > 10) console.log(`   … 其余 ${overwrite.length - 10} 处`);
+  if (!force) {
+    console.log('   确认要放弃这些改动请加 --force；先看差异：status / conflicts / diff');
+    return true;
+  }
+  console.log('   （--force：按上述覆盖继续）');
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // 命令行入口（与 content_manage.py 对齐的轻量实现）
 // ---------------------------------------------------------------------------
 function cli() {
@@ -710,11 +790,18 @@ function cli() {
     return i >= 0 && argv[i + 1] ? argv[i + 1] : undefined;
   };
   const dry = argv.includes('--dry-run');
+  const force = argv.includes('--force') || argv.includes('-f');
   const flatDir = optOf('flat') || cfg.wikiRepo;
   const contentDir = optOf('content') || cfg.contentDir;
   const repo = flatDir;
 
   if (cmd === 'mirror') {
+    // 先预检：mirror 以扁平仓库为准，会回退 content/ 侧的本地改动
+    if (!dry) {
+      const pre = analyzeMirror(flatDir, contentDir);
+      if (warnOverwrite('mirror 会把扁平仓库（线上）的文件写进 content/（以扁平为准）',
+        pre.overwrite, force)) process.exit(1);
+    }
     const s = mirrorToContent(flatDir, contentDir, { dryRun: dry });
     console.log(`mirror: 新建 ${s.created}, 更新 ${s.updated}, 未变 ${s.unchanged}`
       + `, 图片去重 ${s.deduped}${dry ? '（dry-run）' : ''}`);
@@ -724,6 +811,12 @@ function cli() {
       hints.forEach((h) => console.log('   ' + h));
     }
   } else if (cmd === 'flatten') {
+    // 先预检：flatten 以内容树为准，会覆盖扁平仓库的未提交改动
+    if (!dry) {
+      const pre = analyzeFlatten(flatDir, contentDir, repo);
+      if (warnOverwrite('flatten 会把 content/ 写进扁平仓库（以内容树为准）',
+        pre.overwrite, force)) process.exit(1);
+    }
     const s = flattenToFlat(flatDir, contentDir, { dryRun: dry });
     const d = dry ? 0 : dedupeImages(flatDir, contentDir).linked;
     console.log(`flatten: 写入 ${s.written}, 未变 ${s.unchanged}, 图片去重 ${d}${dry ? '（dry-run）' : ''}`);
@@ -823,4 +916,5 @@ module.exports = {
   analyzePublish, applyPublish, refreshContentFromFlat, pendingLocalEdits,
   safeConflictName, defaultConflictDir, writeConflictDiffs, resolveConflictsInteractive,
   contentLayoutConflicts, layoutHints,
+  analyzeMirror, analyzeFlatten, localEdited, OVERWRITE_LABEL,
 };

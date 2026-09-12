@@ -289,6 +289,68 @@ test('CLI：无冲突时 conflicts 明确说明无冲突', () => {
   assert.match(cf.stdout, /无冲突/);
 });
 
+// ---------------------------------------------------------------------------
+// ⑤ 覆盖预检：mirror / flatten 不得静默覆盖对侧改动
+// ---------------------------------------------------------------------------
+test('analyzeMirror/analyzeFlatten：分类「会被覆盖」的文件', () => {
+  baseline({ 'A.mw': 'v1\n', 'B.mw': 'b1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');            // 仅 content 侧改
+  write(path.join(FLAT, 'B.mw'), 'b2 flat\n');          // 仅扁平侧改（未提交）
+
+  const m = cs.analyzeMirror(FLAT, CONTENT);
+  assert.deepStrictEqual(m.overwrite.map((o) => [o.name, o.kind]), [['A.mw', 'content-dirty']]);
+  assert.strictEqual(m.create, 0);
+
+  const f = cs.analyzeFlatten(FLAT, CONTENT, FLAT);
+  assert.deepStrictEqual(f.overwrite.map((o) => [o.name, o.kind]), [['B.mw', 'flat-dirty']]);
+});
+
+test('CLI：mirror 会回退 content 侧改动 → 报警并拒绝（--force 才继续）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');                             // 仅 content 侧改
+
+  const refused = cli(['mirror']);
+  assert.strictEqual(refused.status, 1, '未加 --force 应中止');
+  assert.match(refused.stdout, /会覆盖 1 处/);
+  assert.match(refused.stdout, /content\/ 侧本地改动会被回退/);
+  assert.match(refused.stdout, /--force/);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v2 content\n', 'content 不应被覆盖');
+
+  const forced = cli(['mirror', '--force']);
+  assert.strictEqual(forced.status, 0);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v1\n', '--force 后按扁平侧覆盖');
+});
+
+test('CLI：mirror 的安全场景（仅扁平侧更新）不拦截', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(path.join(FLAT, 'A.mw'), 'v2 flat\n');           // 仅扁平侧改
+  const r = cli(['mirror']);
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(fs.readFileSync(contentPath('A.mw'), 'utf8'), 'v2 flat\n');
+});
+
+test('CLI：flatten 会覆盖扁平未提交改动 → 报警并拒绝（--force 才继续）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(path.join(FLAT, 'A.mw'), 'v2 flat\n');           // 扁平侧有未提交改动
+  const refused = cli(['flatten']);
+  assert.strictEqual(refused.status, 1);
+  assert.match(refused.stdout, /扁平仓库有未提交改动，会被覆盖/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v2 flat\n');
+
+  const forced = cli(['flatten', '--force']);
+  assert.strictEqual(forced.status, 0);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v1\n');
+});
+
+test('CLI：flatten 的安全场景（仅内容树改）不拦截', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 0);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v2 content\n');
+});
+
 // 全部跑完清理沙盒（失败时保留现场便于排查）
 after(() => {
   if (!process.env.KEEP_TEST_SANDBOX) fs.rmSync(ROOT, { recursive: true, force: true });

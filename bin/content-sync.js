@@ -447,143 +447,18 @@ function analyzePublish(flatDir, contentDir, repo) {
 }
 
 // ---------------------------------------------------------------------------
-// 冲突 diff 生成：检测到冲突时为每个冲突页产出 unified diff 文件，
-// 便于用任何文本编辑器（或差异／合并工具）查看并人工合并。
-// 产物目录：<内容树同级>/.content-sync/conflicts（不在 content/ 也不在扁平仓库内，
-// 不会混入页面同步）。
+// 冲突产物目录：<内容树同级>/.content-sync/（不在 content/ 也不在扁平仓库内，不会混入页面同步）
+//   git-merge/  冲突写进 git 时的备份与清单（index.json + <页>.ours）
 // ---------------------------------------------------------------------------
-const CONFLICT_SUBDIR = path.join('.content-sync', 'conflicts');
+const CONFLICT_SUBDIR = path.join('.content-sync');
 
 // 冲突扁平文件名 -> 文件系统安全名（: / \ 会跨目录或引起混淆，替换为 _）
 function safeConflictName(name) {
   return name.replace(/[:\\/]/g, '_');
 }
 
-// 默认冲突产物目录：内容树上一级目录下的 .content-sync/conflicts
-function defaultConflictDir(contentDir) {
-  return path.join(path.resolve(contentDir, '..'), CONFLICT_SUBDIR);
-}
-
-// 某页的冲突 diff 路径（无论文件当前是否存在，用于打印「改这里」路径）
-function conflictDiffPath(contentDir, name, outDir) {
-  return path.join(outDir || defaultConflictDir(contentDir), safeConflictName(name) + '.diff');
-}
-
-// 上次生成的冲突清单（回执）：记录每个 diff 文件的指纹，用于下次复检
-const CONFLICT_STATE = 'state.json';
-
-function readConflictState(dir) {
-  try {
-    const s = JSON.parse(fs.readFileSync(path.join(dir, CONFLICT_STATE), 'utf8'));
-    return { entries: Array.isArray(s.entries) ? s.entries : [] };
-  } catch (e) { return { entries: [] }; }
-}
-
-function writeConflictState(dir, entries) {
-  const f = path.join(dir, CONFLICT_STATE);
-  if (!entries || !entries.length) { fs.rmSync(f, { force: true }); return; }
-  fs.writeFileSync(f, JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2) + '\n');
-}
-
-// 为一批冲突扁平名生成 diff 产物：
-//   <安全名>.diff   unified diff（a=扁平仓库/线上，b=content/ 本地编辑）；二进制图不生成
-//   index.md        总览：真实路径与可直接运行的 code --diff 打开命令
-//   state.json      回执：每个 diff 的指纹（下次复检「是否被人工修改过」）
-// 已被人手修改过的 diff 不会被覆盖，只登记回执并在返回值里报出 keptEdited。
-// 返回 { dir, files: [{ name, diff, flat, content }], keptEdited: [name] }
-function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
-  const dir = outDir || defaultConflictDir(contentDir);
-  fs.mkdirSync(dir, { recursive: true });
-  const prevBy = new Map(readConflictState(dir).entries.map((e) => [e.name, e]));
-  const byFlat = contentNameMap(contentDir).byFlat;
-  const files = [];
-  const entries = [];
-  const keptEdited = [];
-  for (const name of conflictNames) {
-    const flatP = path.join(flatDir, name);
-    const rel = byFlat.get(name);
-    const contentP = rel ? path.join(contentDir, rel) : null;
-    const flatExists = fs.existsSync(flatP);
-    const contentExists = !!contentP && fs.existsSync(contentP);
-    // 二进制图冲突：文本 diff 无意义，只登记到 index.md，提示直接以一侧覆盖
-    if (!isImage(name) && (flatExists || contentExists)) {
-      const a = flatExists ? flatP : '/dev/null';
-      const b = contentExists ? contentP : '/dev/null';
-      const r = spawnSync('git', ['diff', '--no-index', '--', a, b], { encoding: 'utf8' });
-      const diffText = ((r.stdout || '') + (r.stderr || '')).trim();
-      if (diffText) {
-        const diffP = path.join(dir, safeConflictName(name) + '.diff');
-        const prev = prevBy.get(name);
-        const nowSha = fs.existsSync(diffP) ? sha1File(diffP) : null;
-        // 上次登记过指纹、且磁盘上已变样 ⇒ 人工改过：保留别人的版本，不覆盖
-        const edited = !!(prev && prev.diffSha1 && nowSha && nowSha !== prev.diffSha1);
-        if (edited) keptEdited.push(name);
-        else fs.writeFileSync(diffP, diffText + '\n');
-        files.push({ name, diff: diffP, flat: flatP, content: contentP });
-        entries.push({
-          name,
-          diff: path.basename(diffP),
-          // 人工改过时保留旧指纹，下次仍能识别出「这份是人工版」
-          diffSha1: edited ? prev.diffSha1 : sha1File(diffP),
-        });
-        continue;
-      }
-    }
-    files.push({ name, diff: null, flat: flatP, content: contentP }); // 二进制/无文本差异：仅登记
-  }
-  writeConflictState(dir, entries);
-  // 总览 index.md
-  const lines = [
-    '# 内容同步冲突（' + new Date().toISOString() + '）',
-    '',
-    '以下页面在 content/（本地编辑工作区）与扁平仓库（线上来源）被**各自修改**，无法自动合并。',
-    '每个 `*.diff` 均为 unified diff：`a/` = 扁平仓库版本，`b/` = content/ 版本。',
-    '',
-    '## 推荐：写进 git，用 VS Code 源代码管理面板 / 合并编辑器处理',    '',
-    '```bash',
-    'node bin/content-sync.js git-merge     # 把冲突写成真实 git 冲突（UU）',
-    '```',
-    '',
-    '然后在 VS Code 的源代码管理面板 →「合并更改」→ 点文件上的「在合并编辑器中解决」',
-    '（或设 `"git.mergeEditor": true` 后双击文件）→ Current = 扁平仓库/线上、Incoming = content/ 本地 →',
-    '点「完成合并」。回来重跑同步命令（`flatten` / `publish` / `apply`）即自动写回并清掉冲突条目；',
-    '放弃用 `node bin/content-sync.js git-merge --abort`。',
-    '',
-    '## 兜底（无 git / 非文本页）：用文本编辑器改 .diff',
-    '',
-    '1. 打开该页对应的 `<页>.diff`（下面每节的 `diff :` 一行就是路径）；',
-    '2. **整份替换**成该页的**最终正文**——不要保留 `diff --git` / `---` / `+++` / `@@` 这些行，',
-    '   也不要把 `-`、`+` 前缀留在正文里；',
-    '3. 保存，然后**重跑刚才那条命令**（`flatten` / `mirror` / `publish` / `apply`）：',
-    '   工具发现 diff 被改过 → 复检（不会产生新冲突才写）→ 写回两侧 → 继续执行。',
-    '   （只想先看看能不能合并，就跑 `apply`：它只复检写回，不跑同步。）',
-    '',
-    '写回前的校验（不通过就拒绝并回滚，原文件一字不动）：空文件 / 残留冲突标记（`<<<<<<<` 等）/',
-    '内容看着仍是 `@@` diff 结构 / 写回会引入原来冲突之外的新冲突。已解决的 diff 归档为 `<页>.diff.done`。',
-    '',
-    '## 只采用某一侧（不用改 diff）',
-    '',
-    '- 保留 **content/**（本地意图）：把扁平仓库那个文件改成与 content/ 一致；',
-    '- 保留**扁平仓库**（线上最新）：把 content/ 那个文件改成与扁平仓库一致；',
-    '- 或 `node bin/content-sync.js resolve`，逐项输 `f`（扁平→内容）/ `c`（内容→扁平）。',
-    '',
-    '## 兜底：想左右对照两份原文',
-    '',
-    '- 装了 VS Code：`code --diff "<扁平文件>" "<内容文件>"`（也可用任何差异／合并工具）；',
-    '- 没装：用编辑器分别打开下面每节的 `扁平` / `内容` 两个路径即可。',
-    '',
-  ];
-  for (const f of files) {
-    lines.push('## ' + f.name);
-    lines.push('- diff : ' + (f.diff ? '`' + f.diff + '`' : '（二进制，无法生成文本 diff，请直接以一侧覆盖）'));
-    lines.push('- 扁平 : `' + f.flat + '`');
-    lines.push('- 内容 : `' + (f.content || '（content/ 无此页，属删除类冲突）') + '`');
-    lines.push('- 对照 : `code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"`（可选，非必需）');
-    lines.push('');
-  }
-  fs.writeFileSync(path.join(dir, 'index.md'), lines.join('\n'));
-  return { dir, files, keptEdited };
-}
+// 未解决冲突的特征：工作树里的 <<<<<<< / ======= / >>>>>>> 标记
+const MERGE_MARKER_RE = /^(<{7}|={7}|>{7})/m;
 
 // ---------------------------------------------------------------------------
 // 发布：执行内容树 -> 扁平（含删除）；有冲突返回 false
@@ -593,22 +468,16 @@ function applyPublish(flatDir, contentDir, repo, opts = {}) {
   if (layout.dup.length) {
     // index 冲突会令回写读到“错误那份”文件，属内容树自身缺陷：直接中止，让用户先清理
     return {
-      ok: false, conflict: [], conflictDir: null, conflictDiffs: [],
+      ok: false, conflict: [], gitConflicts: { created: [], skipped: [] },
       indexConflicts: layout.dup, indexConflictHints: layoutHints(layout),
     };
   }
   const a = analyzePublish(flatDir, contentDir, repo);
   if (a.conflict.length) {
-    // 冲突时默认自动生成 diff 供差异编辑器查看/合并（可用 opts.writeConflicts=false 关闭）
-    let artifacts = null;
-    if (opts.writeConflicts !== false) {
-      artifacts = writeConflictDiffs(a.conflict, flatDir, contentDir, opts.conflictDir);
-    }
-    return {
-      ok: false, conflict: a.conflict,
-      conflictDir: artifacts && artifacts.dir,
-      conflictDiffs: artifacts && artifacts.files,
-    };
+    // 冲突时默认把它们写进 git（UU），供 VS Code 内置合并编辑器处理（可用 opts.writeConflicts=false 关闭）
+    let gitConflicts = { created: [], skipped: [] };
+    if (opts.writeConflicts !== false) gitConflicts = makeGitMergeConflicts(flatDir, contentDir, repo);
+    return { ok: false, conflict: a.conflict, gitConflicts };
   }
   let written = 0, deleted = 0;
   if (!opts.dryRun) {
@@ -727,16 +596,15 @@ function resolveGitMergeTo(repo, name, side, flatDir, contentDir) {
   return true;
 }
 
-function printEditHints(flatP, contentP, diffP) {
+// 打印「怎么处理这个冲突」：默认写进 git 用 VS Code 合并编辑器；也支持直接改文件
+function printEditHints(flatP, contentP) {
   const ed = pickEditor();
-  if (diffP) {
-    console.log('  改这里（记事本 / nano / vim 均可）：' + diffP);
-    console.log('    整份替换成该页最终正文（别留 -、+、@@ 这些行），保存后重跑本命令即自动写回两侧');
+  console.log('  合并  : VS Code 源代码管理 →「合并更改」→「在合并编辑器中解决」（Current=扁平/线上，Incoming=content/）');
+  if (contentP && fs.existsSync(contentP)) {
+    console.log('  或直接编辑两侧文件改成一致：' + contentP);
+    if (ed) console.log('    例如：' + ed + ' "' + contentP + '"');
   }
-  const side = contentP && fs.existsSync(contentP) ? contentP : flatP;
-  console.log('  或直接编辑两侧文件（改到一致即自动放行）：' + side);
-  if (ed) console.log('    例如：' + ed + ' "' + (diffP || side) + '"');
-  if (hasCodeCli()) console.log('  左右对照（可选，VS Code）：code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
+  if (hasCodeCli()) console.log('  左右对照（可选）：code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
 }
 
 function openCodeDiff(flatP, contentP) {
@@ -773,8 +641,8 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
     }
     console.log(`发现 ${todo.length} 个冲突：解决一个（VS Code 合并编辑器「完成合并」/ 两侧改一致）会**自动**进入下一项。`);
     console.log('也可以直接输入：f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出。');
-    const art = materializeConflicts(todo, flatDir, contentDir, { quiet: true });
-    if (art) console.log(`冲突 diff 已写入：${art.dir}（总览 index.md）`);
+    const art = materializeConflicts(todo, flatDir, contentDir);
+    if (art && art.git.created.length) console.log('（冲突已在 git 里标为 UU，可直接在 VS Code 合并编辑器里解决）');
     let i = 0;
     const wasUnmerged = new Set(listUnmergedPaths(repo));   // 已在 git 里冲突的页：解决后 `git diff -U` 会变空
     const consistentOf = (name, flatP, contentP) => {
@@ -792,7 +660,7 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
       console.log('\n[' + (i + 1) + '/' + todo.length + '] ' + name);
       console.log('  扁平 : ' + flatP);
       console.log('  内容 : ' + (contentP || '（无：content/ 已删此页，删除类冲突）'));
-      printEditHints(flatP, contentP, conflictDiffPath(contentDir, name));
+      printEditHints(flatP, contentP);
       if (fs.existsSync(flatP) || cExists) openCodeDiff(flatP, contentP);
       console.log('  （把两侧改到一致会自动继续；f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出）');
       let waitingShown = false;
@@ -958,160 +826,27 @@ function warnOverwrite(title, overwrite, force, flatDir, contentDir, opts = {}) 
 }
 
 // 统一的「冲突写进 git」入口：凡是检测到冲突的地方都调它。
-//   主产物流向：把冲突写成真实 git 冲突（UU）→ VS Code 源代码管理 → 内置合并编辑器
-//   兼容产物：<内容树同级>/.content-sync/conflicts/<页>.diff + index.md（无 git / 非文本页的兜底）
-function materializeConflicts(names, flatDir, contentDir, opts = {}) {
+// 把冲突写成真实 git 冲突（index 三个 stage + 工作树 <<<<<<< 标记，状态 UU），
+// 供 VS Code 源代码管理 →「合并更改」→ 内置合并编辑器处理。
+// 二进制图片、以及「缺一侧」的删除/新增类冲突无法三方合并，会被跳过（用 resolve 选一侧）。
+function materializeConflicts(names, flatDir, contentDir) {
   if (!names || !names.length) return null;
-  let git = { created: [], skipped: [] };
-  if (opts.git !== false) {
-    try { git = makeGitMergeConflicts(flatDir, contentDir, flatDir); }
-    catch (e) { git = { created: [], skipped: [{ name: '(全部)', why: e.message }] }; }
-  }
-  const art = writeConflictDiffs(names, flatDir, contentDir, opts.outDir);
-  if (opts.quiet) return Object.assign(art, { git });
-  const maxList = opts.maxList === undefined ? 3 : opts.maxList;
+  let git;
+  try { git = makeGitMergeConflicts(flatDir, contentDir, flatDir); }
+  catch (e) { git = { created: [], skipped: [{ name: '(全部)', why: e.message }] }; }
   if (git.created.length) {
     console.log(`⚠️ 已把 ${git.created.length} 个冲突写进 git（扁平仓库 index，状态 UU）：`);
-    git.created.slice(0, maxList).forEach((n) => console.log('   - ' + n));
-    if (git.created.length > maxList) console.log(`   … 其余 ${git.created.length - maxList} 个`);
-    console.log('   → VS Code 源代码管理 →「合并更改」→「在合并编辑器中解决」' +
-      (hasCodeCli() ? '（或此处直接：code .）' : '') + '，合并后点「完成合并」；');
-    console.log('   → 回终端重跑本命令（或 content-sync.js apply）：自动写回 content/ 并清掉冲突条目。');
+    git.created.forEach((n) => console.log('   - ' + n));
+    console.log('   → VS Code 源代码管理 →「合并更改」→「在合并编辑器中解决」'
+      + (hasCodeCli() ? '（或此处直接：code .）' : '') + '，合并后点「完成合并」；');
+    console.log('   → 回终端重跑本命令（或 content-sync.js apply）：结果会进暂存区，并同步回 content/。');
     console.log('   （放弃：node bin/content-sync.js git-merge --abort）');
   }
   if (git.skipped.length) {
-    console.log(`   其余 ${git.skipped.length} 个无法三方合并（二进制 / 缺一侧）：用 resolve 选一侧，或改下面的兜底 diff`);
+    console.log(`   其余 ${git.skipped.length} 个无法三方合并（二进制 / 缺一侧）：用 content-sync.js resolve 选一侧`);
+    for (const s of git.skipped.slice(0, 5)) console.log(`     - ${s.name}（${s.why}）`);
   }
-  console.log(`   文本兜底 diff：${art.dir}（总览 ${path.join(art.dir, 'index.md')}）`);
-  if (art.keptEdited && art.keptEdited.length) {
-    console.log(`   注意 : ${art.keptEdited.join('、')} 的 .diff 已被你修改过，本次未覆盖`);
-  }
-  return art;
-}
-
-// ---------------------------------------------------------------------------
-// 「改过 diff 就自动合并」：上次生成的冲突 diff 被人工修改（用任何外部差异编辑器
-// 或直接编辑保存）后，重跑同步命令时先复检：
-//   1) 把改后的 diff 内容当作该页**最终正文**；
-//   2) 校验：非空、文本、无冲突标记、不再像未处理的 diff；
-//   3) 写回两侧（扁平仓库 + content/）后重新盘点冲突，必须
-//      「不出现原来冲突之外的新冲突」，否则回滚、保持原样；
-//   4) 通过后本次同步命令继续执行（不再要求 --force）。
-// 两侧已被人手改到一致、或 diff 已被删掉，也一并复检放行。
-// ---------------------------------------------------------------------------
-const MERGE_MARKER_RE = /^(<{7}|={7}|>{7})/m;
-const RAW_DIFF_RE = /^(diff --git |--- a\/|\+\+\+ b\/|@@ )/m;
-
-// 当前所有「会被覆盖/冲突」的文件名集合（跨 publish/mirror/flatten 三种视角）
-function conflictInventory(flatDir, contentDir, repo) {
-  const names = new Set();
-  for (const n of analyzePublish(flatDir, contentDir, repo).conflict) names.add(n);
-  for (const o of analyzeMirror(flatDir, contentDir).overwrite) names.add(o.name);
-  for (const o of analyzeFlatten(flatDir, contentDir, repo).overwrite) names.add(o.name);
-  const layout = contentLayoutConflicts(contentDir);
-  for (const d of layout.dup) names.add('布局:' + d.flat);
-  for (const r of layout.nonIndex.concat(layout.loneIndex)) names.add('布局:' + r);
-  return names;
-}
-
-// 校验人工结果能否安全写回；返回 null 表示通过，否则返回拒绝原因
-function mergeResultProblem(text) {
-  if (/^\s*$/.test(text)) return '文件是空的（如确实要清空该页，请写入一个换行，或用 resolve 显式选一侧）';
-  if (text.indexOf('\u0000') !== -1) return '内容含 NUL 字节（二进制），无法写回文本页';
-  if (MERGE_MARKER_RE.test(text)) return '还留有冲突标记（<<<<<<< / ======= / >>>>>>>），合并尚未完成';
-  if (RAW_DIFF_RE.test(text)) return '内容仍是未处理的 diff（含 @@ 或 --- a/ 结构），请写入合并后的页面正文';
-  return null;
-}
-
-// 把最终正文写回两侧，返回快照（用于回滚）
-function writeMergedToBothSides(name, text, flatDir, contentDir) {
-  const rel = contentNameMap(contentDir).byFlat.get(name);
-  const targets = [path.join(flatDir, name)];
-  if (rel) targets.push(path.join(contentDir, rel));
-  const snapshot = [];
-  for (const p of targets) {
-    const had = fs.existsSync(p);
-    snapshot.push({ p, had, data: had ? fs.readFileSync(p) : null });
-    writeIfChanged(text, p);
-  }
-  return snapshot;
-}
-
-function restoreSnapshot(snapshot) {
-  for (const s of snapshot) {
-    if (s.had) fs.writeFileSync(s.p, s.data);
-    else fs.rmSync(s.p, { force: true });
-  }
-}
-
-// 把已解决的冲突 diff 归档（保留内容供追溯，但不再参与复检）
-function archiveConflictDiff(diffP) {
-  if (!diffP || !fs.existsSync(diffP)) return null;
-  const done = diffP + '.done';
-  try { fs.renameSync(diffP, done); return done; } catch (e) { return null; }
-}
-
-// 复检上次的冲突回执：diff 被改过 → 写回两侧；返回各分类结果
-function autoApplyEditedDiffs(flatDir, contentDir, repo, opts = {}) {
-  const quiet = !!opts.quiet;
-  const dir = opts.outDir || defaultConflictDir(contentDir);
-  const before = conflictInventory(flatDir, contentDir, repo);
-  const res = { dir, applied: [], failed: [], resolved: [], pending: [] };
-  const entries = readConflictState(dir).entries;
-  if (!entries.length) return res;
-
-  const kept = [];
-  for (const e of entries) {
-    const flatP = path.join(flatDir, e.name);
-    const rel = contentNameMap(contentDir).byFlat.get(e.name);
-    const contentP = rel ? path.join(contentDir, rel) : null;
-    const flatSha = fs.existsSync(flatP) ? sha1File(flatP) : null;
-    const contentSha = contentP && fs.existsSync(contentP) ? sha1File(contentP) : null;
-
-    if (flatSha !== null && flatSha === contentSha) {   // 复检：两侧已无差异
-      archiveConflictDiff(e.diff ? path.join(dir, e.diff) : null);
-      res.resolved.push(e.name); continue;
-    }
-    const diffP = e.diff ? path.join(dir, e.diff) : null;
-    if (!diffP || !fs.existsSync(diffP)) { res.pending.push(e.name); kept.push(e); continue; }
-    if (!e.diffSha1 || sha1File(diffP) === e.diffSha1) { res.pending.push(e.name); kept.push(e); continue; }
-
-    // diff 被人工改过 → 当成本页最终正文
-    const text = fs.readFileSync(diffP, 'utf8');
-    const why = mergeResultProblem(text);
-    if (why) { res.failed.push({ name: e.name, why }); kept.push(e); continue; }
-    const snapshot = writeMergedToBothSides(e.name, text, flatDir, contentDir);
-    const added = [...conflictInventory(flatDir, contentDir, repo)].filter((n) => !before.has(n));
-    if (added.length) {
-      restoreSnapshot(snapshot);   // 出现原来冲突之外的新冲突 → 回滚，绝不写坏
-      res.failed.push({ name: e.name, why: `写回会产生新冲突：${added.join('、')}（已回滚）` });
-      kept.push(e); continue;
-    }
-    res.applied.push({ name: e.name, flat: flatP, content: contentP, done: archiveConflictDiff(diffP) });
-  }
-  writeConflictState(dir, kept);   // 已解决/已应用的条目出账，剩下的留待下次
-
-  if (!quiet) {
-    if (res.applied.length) {
-      console.log(`✏️ 检测到 ${res.applied.length} 个冲突 diff 被人工修改过：已复检并写回两侧`);
-      for (const a of res.applied) {
-        console.log(`   ✔ ${a.name} → 扁平仓库 + ${a.content ? 'content/' : '（content/ 无此页）'} 已一致`
-          + (a.done ? `（diff 归档为 ${path.basename(a.done)}）` : ''));
-      }
-    }
-    if (res.resolved.length) console.log(`✅ ${res.resolved.length} 个冲突已无差异（两侧一致）：${res.resolved.join('、')}`);
-    if (res.failed.length) {
-      console.log('⚠️ 以下人工结果未被采用（原文件保持不动）：');
-      for (const f of res.failed) console.log(`   ✗ ${f.name}：${f.why}`);
-      console.log(`   修正后可重跑本命令；或换用：node content-sync.js resolve（交互选择一侧）`);
-    }
-    if (res.pending.length) {
-      console.log(`⏳ 仍有 ${res.pending.length} 个冲突未解决：${res.pending.join('、')}`);
-      console.log('   在 VS Code 源代码管理 →「合并更改」→ 合并编辑器解决（git 合并），或直接改冲突 diff；');
-      console.log(`   解决后重跑本命令：node content-sync.js apply`);
-    }
-  }
-  return res;
+  return { git };
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,14 +1049,9 @@ function cli() {
   const contentDir = optOf('content') || cfg.contentDir;
   const repo = flatDir;
 
-  // 会写文件的命令：先收尾「已经在 git / diff 里解决」的冲突，然后继续原命令
-  //   1) git 原生冲突（git-merge 造出来的）：工作树已无 <<<<<<< 标记 → 同步回 content/ 并清 unmerged
-  //   2) 冲突 diff 产物被人工改过 → 当成本页最终正文写回两侧
-  let autoRes = null;
+  // 会写文件的命令：先把「已在 VS Code 里解决」的 git 冲突收尾（同步回 content/ + git add）
   if (['mirror', 'flatten', 'resolve', 'apply'].includes(cmd) && !dry) {
     finishGitMerges(flatDir, contentDir, repo);
-    autoRes = autoApplyEditedDiffs(flatDir, contentDir, repo);
-    finishGitMerges(flatDir, contentDir, repo, { quiet: true });   // diff 刚写回的结果也顺手收尾一次
   }
 
   if (cmd === 'mirror') {
@@ -1372,9 +1102,8 @@ function cli() {
       hints.forEach((h) => console.log('   ' + h));
     }
     if (a.conflict.length) {
-      const c = writeConflictDiffs(a.conflict, flatDir, contentDir);
-      console.log(`  ⚠️ 已为 ${c.files.length} 个冲突生成 diff：${c.dir}`);
-      console.log(`    总览: ${path.join(c.dir, 'index.md')}（已在 git 里标为 UU：VS Code 源代码管理 →「合并更改」→ 合并编辑器）`);
+      console.log('  ⚠️ 冲突已在 git 里标为 UU：VS Code 源代码管理 →「合并更改」→ 合并编辑器');
+      materializeConflicts(a.conflict, flatDir, contentDir);
     }
     if (pend.length) console.log(`⚠️ 内容树有未发布改动: ${pend.length}`, pend.slice(0, 15));
   } else if (cmd === 'check') {
@@ -1427,19 +1156,22 @@ function cli() {
       console.log('无冲突：内容树与扁平仓库没有“两侧各自改同一页”的情况。');
     } else {
       console.log(`共 ${a.conflict.length} 个冲突：`);
-      materializeConflicts(a.conflict, flatDir, contentDir, { maxList: 99 });
+      const r = materializeConflicts(a.conflict, flatDir, contentDir);
+      const stillU = listUnmergedPaths(repo);
+      if (r && !r.git.created.length && stillU.length) {
+        console.log(`   已在 git 里标为 UU：${stillU.join('、')}（VS Code 源代码管理 →「合并更改」）`);
+      }
     }
   } else if (cmd === 'resolve') {
     resolveConflictsInteractive(flatDir, contentDir, repo);
   } else if (cmd === 'apply') {
-    // 只做复检与写回，不跑同步：适合「我处理完了，先看看能不能合并」
-    const r = autoRes || autoApplyEditedDiffs(flatDir, contentDir, repo);
-    const left = r.pending.concat(r.failed.map((f) => f.name));
-    if (!left.length) console.log('✅ 冲突均已解决：可继续 flatten / publish。');
+    // 只做收尾（把已解决的冲突同步回 content/ + git add），不跑同步
+    const left = listUnmergedPaths(repo);
+    if (!left.length) console.log('✅ 无未解决的 git 冲突：可继续 flatten / publish。');
     else {
       console.log(`⚠️ 仍有 ${left.length} 个冲突未解决：${left.join('、')}`);
-      console.log('   在 VS Code 源代码管理 →「合并更改」→ 合并编辑器解决（还没写进 git 就先跑 git-merge）；');
-      console.log('   也可改冲突 .diff（文本兜底）或 node content-sync.js resolve 选一侧，然后重跑本命令。');
+      console.log('   在 VS Code 源代码管理 →「合并更改」→ 合并编辑器解决（点「完成合并」后重跑本命令）；');
+      console.log('   也可 node content-sync.js resolve 逐项选一侧。');
       process.exit(1);
     }
   } else if (cmd === 'git-merge') {
@@ -1482,9 +1214,9 @@ module.exports = {
   gitDirty, gitTracked, sha1Head,
   mirrorToContent, flattenToFlat, contentNameMap, buildState,
   analyzePublish, applyPublish, refreshContentFromFlat, pendingLocalEdits,
-  safeConflictName, defaultConflictDir, writeConflictDiffs, resolveConflictsInteractive,
+  safeConflictName, resolveConflictsInteractive, printEditHints,
   contentLayoutConflicts, layoutHints,
   analyzeMirror, analyzeFlatten, localEdited, OVERWRITE_LABEL, materializeConflicts,
-  writeIfChanged, autoApplyEditedDiffs, conflictInventory, readConflictState, writeConflictState,
+  writeIfChanged,
   makeGitMergeConflicts, finishGitMerges, abortGitMerges, listUnmergedPaths, conflictNames,
 };

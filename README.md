@@ -85,14 +85,14 @@ node bin/sync.js
 | `node bin/sync.js [远程]` | 拉取远程（缺省主 remote）并变基、整理进 content/ |
 | `node bin/set-pass.js [用户]` | 设置登录凭据（写入 `remote.<remote>.mwlogin/mwpassword`） |
 | `node bin/content-sync.js status` | 查看两侧差异（`!` = 冲突） |
-| `node bin/content-sync.js mirror` | 扁平仓库 → 内容树（首次初始化）；会回退 content/ 侧本地改动时**先自动生成冲突 diff** 并要求 `--force` |
-| `node bin/content-sync.js flatten` | 内容树 → 扁平仓库（一般 publish 已自动做）；会覆盖扁平仓库未提交改动时**先自动生成冲突 diff** 并要求 `--force` |
+| `node bin/content-sync.js mirror` | 扁平仓库 → 内容树（首次初始化）；会把 content/ 侧本地改动**写进 git 冲突**并要求 `--force` |
+| `node bin/content-sync.js flatten` | 内容树 → 扁平仓库（一般 publish 已自动做）；会覆盖扁平仓库未提交改动时**写进 git 冲突**并要求 `--force` |
 | `node bin/content-sync.js check` | 往返一致性自检 |
-| `node bin/content-sync.js conflicts` | 列出冲突并生成 `<内容树同级>/.content-sync/conflicts/*.diff` + `index.md` |
+| `node bin/content-sync.js conflicts` | 列出冲突并写进 git（`UU`），供 VS Code「合并更改」处理 |
 | `node bin/content-sync.js resolve` | 逐个解决冲突：停在命令行，**两侧改到一致会自动进入下一项**（也可 f/c/s/q） |
-| `node bin/content-sync.js apply` | 只做复检写回（git 冲突 / 改过的 diff 都认），不跑同步（有遗留冲突时退出码 1） |
+| `node bin/content-sync.js apply` | 只做收尾（已解决的冲突 → 暂存 + 同步回 content/），不跑同步（有遗留冲突时退出码 1） |
 | `node bin/content-sync.js git-merge` | 把冲突写成**真实 git 冲突**（`UU`）供 VS Code 源代码管理面板 → 合并编辑器处理（检测到冲突时已自动做过）；`--abort` 撤销 |
-| `npm run open-conflicts` | 逐个打开冲突（默认 `code --merge`，`--mode diff` 改差异编辑器）；回车开下一个 |
+| `npm run open-conflicts` | 逐个打开冲突（默认在 VS Code 打开冲突文件，`--mode diff` 改两窗格对照）；回车开下一个 |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
 | `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史 |
 
@@ -120,8 +120,8 @@ node bin/sync.js
 1. 在扁平仓库 index 里写入三个 stage —— `1` = `HEAD`（共同祖先）、`2` = 扁平工作树（**线上**，
    合并编辑器里的 **Current**）、`3` = `content/`（**本地**，**Incoming**），工作树文件写成带
    `<<<<<<<` 标记的版本；于是 `git status` 显示 `UU`，VS Code 源代码管理面板把它列进**「合并更改」**；
-2. 顺便在 `<内容树同级>/.content-sync/conflicts/` 留一份**文本兜底**（`<页>.diff` + `index.md`），
-   供无 git / 非文本页使用。
+（二进制图片、以及「只有一侧有文件」的删除/新增类冲突无法三方合并，会被跳过并提示 —— 用
+`resolve` 选一侧即可。）
 
 然后：
 
@@ -148,20 +148,23 @@ node bin/content-sync.js apply            # 只复检写回，不跑同步（有
 > - `--force` 是「以某一侧为准」的语义：`mirror --force` 按扁平/线上采用、`flatten --force` 按
 >   `content/` 采用，并顺手清掉这些 git 冲突条目。
 
-### 兜底：非文本页 / 无 git 环境
+### 兜底：非文本页（二进制 / 删除类）
 
-二进制图片、以及「只有一侧有文件」的删除/新增类冲突无法三方合并，会被自动跳过（提示里会列出来）：
-
-- 用 `node bin/content-sync.js resolve` 逐项输 `f`（扁平→内容）/ `c`（内容→扁平）；
-- 或用**任何文本编辑器**打开 `.content-sync/conflicts/<页>.diff`，整份替换成该页**最终正文**
-  （别留 `-`、`+`、`@@` 这些 diff 符号），保存后重跑命令 —— 工具复检（不会产生新冲突才写）
-  后写回两侧，并把 `.diff` 归档为 `<页>.diff.done`。
-
-想在 VS Code 里逐个无障碍处理（弹一个、解决一个回车下一个）：
+三方合并只对「两侧都有文件的文本页」有效。二进制图片、以及「只有一侧有文件」的删除/新增类冲突
+会被自动跳过（输出里会列出），用交互式命令选一侧即可：
 
 ```bash
-npm run open-conflicts                  # 逐个打开三方合并编辑器（code --merge，结果写进 .diff）
-npm run open-conflicts -- --mode diff    # 改为逐个打开差异编辑器（code --diff）
+node bin/content-sync.js resolve     # 逐项输 f（采用扁平→内容）/ c（采用内容→扁平）/ s 跳过 / q 退出
+```
+
+也可用**任何编辑器**直接改扁平仓库里带 `<<<<<<<` 标记的工作树文件（留最终正文、删掉标记），
+或把两侧文件改成一致，然后重跑同步命令 —— 一样会被收尾（暂存 + 同步回 content/）。
+
+想逐个无障碍处理（打开一个、处理完回车开下一个）：
+
+```bash
+npm run open-conflicts                  # 默认：在 VS Code 里打开冲突文件本身（可用合并编辑器）
+npm run open-conflicts -- --mode diff    # 改为两窗格对照：code --diff 扁平 内容
 ```
 
 VS Code 内部（不敲命令）：`Ctrl+Shift+P` → **任务: 运行任务**（Tasks: Run Task），可选
@@ -282,8 +285,8 @@ KEEP_TEST_SANDBOX=1 npm test    # 失败时保留沙盒现场（打印路径）
 `test/content-sync.test.js` 覆盖 content/ 内容树 ↔ 扁平仓库的**冲突处理流程**：
 
 - 判定矩阵：两侧一致 / 仅内容树改（待回写）/ 仅扁平改（扁平新改动）/ 两侧各自改（**冲突**）/ 内容树删页（待删除）；
-- 冲突产物：`.content-sync/conflicts/<页>.diff`（a=扁平仓库、b=content/）+ `index.md`；
-- 冲突时 `applyPublish` 中止，且**两侧文件都不被改动**；
+- 冲突写进 git：index 三个 stage、`git status` 为 `UU`、工作树带 `<<<<<<<` 标记；
+- 冲突时 `applyPublish` 中止（content/ 不被改动），已解决的冲突重跑命令后进**暂存区**并同步回 content/；
 - `resolve` 交互流程：命令行喂 `f`（采用扁平→内容）/ `c`（采用内容→扁平）后冲突消失、可继续发布；
 - 布局冲突：`X.mw` 与 `X/index.mw` 并存 → 检出 `dup` 并拒绝发布（附处置建议）；
 - 映射与去重：`mirrorRel` ↔ `flatName` 往返一致、`flatten` 幂等、`content/images` 与扁平仓库图片共享 inode；

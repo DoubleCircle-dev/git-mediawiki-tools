@@ -491,7 +491,6 @@ async function main() {
     //     复检后写回两侧（会产生新冲突则回滚），然后继续发布，无需 --force。
     //     若冲突是用 git-merge 写进 git 的（VS Code 合并编辑器）：工作树已无冲突标记 → 同步回 content/ 并清 unmerged。
     contentSync.finishGitMerges(REPO_DIR, CONTENT_DIR, REPO_DIR);
-    contentSync.autoApplyEditedDiffs(REPO_DIR, CONTENT_DIR, REPO_DIR);
 
     // 0b. 删除预检：页面「content/ 没有、扁平仓库仍跟踪」＝待删除，先列清单并等确认；
     //     对 git-mediawiki 删不掉的（非 wikitext 内容模型）改为清空 + 同格式注释占位。
@@ -505,13 +504,13 @@ async function main() {
       console.log('❌ 检测到内容冲突，发布中止（未改动任何文件）：');
       for (const n of pub.conflict) console.log('   ! ' + n);
       console.log('   原因: 这些页面在 content/ 与扁平仓库被各自修改，需先人工合并后再发布');
-      if (pub.conflictDiffs && pub.conflictDiffs.length) {
+      if (pub.gitConflicts && pub.gitConflicts.created.length) {
         console.log(`   ⚠️ 冲突已写进 git（扁平仓库 index，UU）——直接在 VS Code 里解决：`);
         console.log('     源代码管理 →「合并更改」→ 点文件上的「在合并编辑器中解决」→ 选 Accept Current/Incoming →「完成合并」');
-        console.log('     然后重跑 publish：会自动写回 content/ 并清掉冲突条目（放弃：content-sync.js git-merge --abort）');
-        for (const f of pub.conflictDiffs) {
-          if (f.diff) console.log('     文本兜底 diff：' + f.diff);
-        }
+        console.log('     然后重跑 publish：结果会进暂存区、写回 content/，再继续发布（放弃：content-sync.js git-merge --abort）');
+      } else if (pub.gitConflicts && pub.gitConflicts.skipped.length) {
+        console.log('   ⚠️ 这些冲突无法三方合并（二进制 / 缺一侧）：用 content-sync.js resolve 选一侧');
+        for (const s of pub.gitConflicts.skipped) console.log('     - ' + s.name + '（' + s.why + '）');
       } else {
         console.log('   处理: 在 content/ 对应文件与扁平仓库间取一致后，重新运行 node publish.js');
       }

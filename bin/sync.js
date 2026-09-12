@@ -95,7 +95,6 @@ async function main() {
   // 0) 若冲突已在 VS Code 合并编辑器里解决（工作树不再有 <<<<<<< 标记）：同步回 content/ 并 git add
   //    —— VS Code 里表现为「合并更改」→「暂存更改」；仍带标记的则中止，避免带着冲突去 fetch/rebase。
   contentSync.finishGitMerges(REPO_DIR, CONTENT_DIR, REPO_DIR);
-  contentSync.autoApplyEditedDiffs(REPO_DIR, CONTENT_DIR, REPO_DIR);
   const stillUnmerged = contentSync.listUnmergedPaths(REPO_DIR);
   if (stillUnmerged.length) {
     console.log('');

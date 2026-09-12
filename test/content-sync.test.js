@@ -615,6 +615,101 @@ test('CLI：没有 code 时改 diff 重跑同样自动写回两侧（纯文本�
   assert.strictEqual(fs.readFileSync(cp, 'utf8'), '纯文本编辑器合并结果\n');
 });
 
+// ---------------------------------------------------------------------------
+// ⑨ 把冲突写进 git（VS Code 源代码管理面板 → 内置合并编辑器）
+// ---------------------------------------------------------------------------
+function unmerged() {
+  return sh('git', ['diff', '--name-only', '--diff-filter=U'], FLAT).trim();
+}
+
+test('git-merge：把冲突写进 git（UU + 工作树带标记），未解决时不会提交', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const made = cli(['git-merge']);
+  assert.strictEqual(made.status, 0, made.stdout + made.stderr);
+  assert.match(made.stdout, /已把 1 个冲突写进 git/);
+  assert.strictEqual(unmerged(), 'A.mw');
+  const marked = fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8');
+  assert.match(marked, /^<{7}/m);
+  assert.match(marked, /={7}/);
+  assert.match(marked, /^>{7}/m);
+  assert.match(marked, /v3 flat/);
+  assert.match(marked, /v2 content/);
+  assert.strictEqual(sh('git', ['status', '--porcelain'], FLAT).trim().slice(0, 2), 'UU');
+
+  // 未解决：重跑同步/发布不能把带标记的文件写出去
+  const blocked = cli(['flatten']);
+  assert.strictEqual(blocked.status, 1);
+  const head = sh('git', ['rev-parse', 'HEAD'], FLAT);
+  assert.strictEqual(sh('git', ['rev-parse', 'HEAD'], FLAT), head, '不应产生新提交');
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v2 content\n');
+});
+
+test('git-merge：合并编辑器解决（写结果 + git add）后，重跑命令自动收尾同步 content/', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  assert.strictEqual(cli(['git-merge']).status, 0);
+
+  // 等价于 VS Code 合并编辑器「完成合并」：写出结果并标记为已解决（git add）
+  write(path.join(FLAT, 'A.mw'), '合并结果（来自合并编辑器）\n');
+  sh('git', ['add', '--', 'A.mw'], FLAT);
+
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /git 合并冲突已解决 1 个/);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), '合并结果（来自合并编辑器）\n');
+  assert.strictEqual(unmerged(), '');
+  assert.deepStrictEqual(cs.analyzePublish(FLAT, CONTENT, FLAT).conflict, []);
+});
+
+test('git-merge：只写结果、没 git add（未 stage）时收尾也能识别并清理', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  assert.strictEqual(cli(['git-merge']).status, 0);
+
+  write(path.join(FLAT, 'A.mw'), '只保存未 stage 的结果\n');   // 模拟编辑器只保存
+  const r = cli(['apply']);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), '只保存未 stage 的结果\n');
+  assert.strictEqual(unmerged(), '');
+});
+
+test('git-merge --abort：还原扁平侧工作树并清掉 unmerged，content/ 不受影响', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  assert.strictEqual(cli(['git-merge']).status, 0);
+  assert.strictEqual(unmerged(), 'A.mw');
+
+  const r = cli(['git-merge', '--abort']);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /已撤销 1 个 git 合并冲突/);
+  assert.strictEqual(unmerged(), '');
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v2 content\n');
+});
+
+test('git-merge：二进制图片 / 删除类冲突跳过（仍走 diff 流程）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  fs.rmSync(contentPath('A.mw'));                       // content 侧删页 → 缺一侧
+
+  const r = cli(['git-merge']);
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /缺一侧/);
+  assert.strictEqual(unmerged(), '');
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
+});
+
 // 全部跑完清理沙盒（失败时保留现场便于排查）
 after(() => {
   if (!process.env.KEEP_TEST_SANDBOX) fs.rmSync(ROOT, { recursive: true, force: true });

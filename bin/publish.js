@@ -489,6 +489,8 @@ async function main() {
 
     // 0a. 若上次生成的冲突 diff 被人工改过（任何外部差异编辑器改完保存）→
     //     复检后写回两侧（会产生新冲突则回滚），然后继续发布，无需 --force。
+    //     若冲突是用 git-merge 写进 git 的（VS Code 合并编辑器）：工作树已无冲突标记 → 同步回 content/ 并清 unmerged。
+    contentSync.finishGitMerges(REPO_DIR, CONTENT_DIR, REPO_DIR);
     contentSync.autoApplyEditedDiffs(REPO_DIR, CONTENT_DIR, REPO_DIR);
 
     // 0b. 删除预检：页面「content/ 没有、扁平仓库仍跟踪」＝待删除，先列清单并等确认；

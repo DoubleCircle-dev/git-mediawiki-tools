@@ -36,6 +36,7 @@
     "preview:start": "node bin/preview.js start",
     "preview:watch": "node bin/preview.js watch",
     "preview:stop": "node bin/preview.js stop",
-    "preview:squash": "node bin/preview.js squash"
+    "preview:squash": "node bin/preview.js squash",
+    "open-conflicts": "bash tools/open-conflicts.sh"
   }
 }

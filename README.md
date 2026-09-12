@@ -197,6 +197,27 @@ node bin/preview.js import <file>...  # 一次性导入指定 .mw / 图片
 
 把 `jsonContentModels` 设为 `true` 并提供 `apiUrl`（或 `wikiBaseUrl`）。推送后脚本会扫描仓库里内容为合法 JSON 的 `.mw` 文件，通过 API 把它们的内容模型修正为 `json`（幂等，已是 json 的跳过）。
 
+## 测试
+
+零依赖（Node 内置 `node:test`），全程在 `os.tmpdir()` 的临时 git 仓库沙盒里跑，**不碰真实仓库与线上**：
+
+```bash
+npm test                        # 全部用例
+KEEP_TEST_SANDBOX=1 npm test    # 失败时保留沙盒现场（打印路径）
+```
+
+`test/content-sync.test.js` 覆盖 content/ 内容树 ↔ 扁平仓库的**冲突处理流程**：
+
+- 判定矩阵：两侧一致 / 仅内容树改（待回写）/ 仅扁平改（扁平新改动）/ 两侧各自改（**冲突**）/ 内容树删页（待删除）；
+- 冲突产物：`.content-sync/conflicts/<页>.diff`（a=扁平仓库、b=content/）+ `index.md`；
+- 冲突时 `applyPublish` 中止，且**两侧文件都不被改动**；
+- `resolve` 交互流程：命令行喂 `f`（采用扁平→内容）/ `c`（采用内容→扁平）后冲突消失、可继续发布；
+- 布局冲突：`X.mw` 与 `X/index.mw` 并存 → 检出 `dup` 并拒绝发布（附处置建议）；
+- 映射与去重：`mirrorRel` ↔ `flatName` 往返一致、`flatten` 幂等、`content/images` 与扁平仓库图片共享 inode；
+- CLI：`status` / `conflicts` / `check` 的输出与退出码。
+
+> 已知保守判定：`resolve` 采用某一侧后，若**扁平工作树仍是未提交改动**就直接再改 `content/`，会被当成「两侧各自改动」判冲突；正常流程是 `resolve` 后先发布一次（把扁平侧状态提交成基线）再继续编辑。
+
 ## 常见问题
 
 - **推送被拒 non-fast-forward**：说明远程有你本地没有的修订。先 `node bin/sync.js` 同步；若本地 notes 修订号落后于远程（例如站端直接编辑产生了新修订而 recentchanges 滞后），需要把本地 notes 播种到远程实际修订号后重推。

@@ -630,6 +630,8 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
     }
     console.log(`发现 ${todo.length} 个冲突，逐个在 VS Code 差异编辑器解决（命令行同步推进）：`);
     console.log('提示：在差异编辑器把两侧改成一致并保存后回车；或直接输入 f/c 由命令行采用一侧。');
+    const art = materializeConflicts(todo, flatDir, contentDir, { quiet: true });
+    if (art) console.log(`冲突 diff 已写入：${art.dir}（总览 index.md）`);
     let i = 0;
     const consistentOf = (flatP, contentP) => {
       if (!fs.existsSync(flatP)) return false;
@@ -760,20 +762,40 @@ function analyzeFlatten(flatDir, contentDir, repo) {
   return { overwrite };
 }
 
-// 打印覆盖警告；返回 true 表示“需要 --force 才能继续”
-function warnOverwrite(title, overwrite, force) {
+// 打印覆盖警告（并**自动生成冲突 diff**）；返回 true 表示“需要 --force 才能继续”
+function warnOverwrite(title, overwrite, force, flatDir, contentDir) {
   if (!overwrite.length) return false;
   console.log(`⚠️ ${title}，会覆盖 ${overwrite.length} 处：`);
   for (const o of overwrite.slice(0, 10)) {
     console.log(`   - ${o.name}（${OVERWRITE_LABEL[o.kind] || o.kind}）`);
   }
   if (overwrite.length > 10) console.log(`   … 其余 ${overwrite.length - 10} 处`);
+  materializeConflicts(overwrite.map((o) => o.name), flatDir, contentDir);
   if (!force) {
-    console.log('   确认要放弃这些改动请加 --force；先看差异：status / conflicts / diff');
+    console.log('   确认要放弃这些改动请加 --force；要合并两侧改动：conflicts → resolve（或用上面的 diff）');
     return true;
   }
   console.log('   （--force：按上述覆盖继续）');
   return false;
+}
+
+// 统一的「冲突产物」入口：凡是检测到冲突的地方都调它，把 diff 落到磁盘并打印位置。
+// 产物：<内容树同级>/.content-sync/conflicts/<页>.diff + index.md（a=扁平仓库、b=content/）
+function materializeConflicts(names, flatDir, contentDir, opts = {}) {
+  if (!names || !names.length) return null;
+  const art = writeConflictDiffs(names, flatDir, contentDir, opts.outDir);
+  if (opts.quiet) return art;
+  const maxList = opts.maxList === undefined ? 3 : opts.maxList;
+  console.log(`⚠️ 已生成冲突 diff（${art.files.length} 个）：${art.dir}`);
+  for (const f of art.files.slice(0, maxList)) {
+    console.log(`   ${f.name}`);
+    console.log(`     查看 : code --diff "${f.flat}" "${f.content || '/dev/null'}"`);
+  }
+  if (art.files.length > maxList) {
+    console.log(`   … 其余 ${art.files.length - maxList} 个见 index.md`);
+  }
+  console.log(`   总览 : ${path.join(art.dir, 'index.md')}`);
+  return art;
 }
 
 // ---------------------------------------------------------------------------
@@ -800,7 +822,7 @@ function cli() {
     if (!dry) {
       const pre = analyzeMirror(flatDir, contentDir);
       if (warnOverwrite('mirror 会把扁平仓库（线上）的文件写进 content/（以扁平为准）',
-        pre.overwrite, force)) process.exit(1);
+        pre.overwrite, force, flatDir, contentDir)) process.exit(1);
     }
     const s = mirrorToContent(flatDir, contentDir, { dryRun: dry });
     console.log(`mirror: 新建 ${s.created}, 更新 ${s.updated}, 未变 ${s.unchanged}`
@@ -815,7 +837,7 @@ function cli() {
     if (!dry) {
       const pre = analyzeFlatten(flatDir, contentDir, repo);
       if (warnOverwrite('flatten 会把 content/ 写进扁平仓库（以内容树为准）',
-        pre.overwrite, force)) process.exit(1);
+        pre.overwrite, force, flatDir, contentDir)) process.exit(1);
     }
     const s = flattenToFlat(flatDir, contentDir, { dryRun: dry });
     const d = dry ? 0 : dedupeImages(flatDir, contentDir).linked;
@@ -872,7 +894,10 @@ function cli() {
     (a.refreshAfter || []).forEach((n) => pushRow(n, '扁平→内容树(待刷新)'));
     if (!rows.length) {
       console.log('无待同步差异：扁平仓库与 content/ 已一致。');
-      if (a.conflict.length) console.log(`（另有 ${a.conflict.length} 个冲突需人工：node content-sync.js resolve）`);
+      if (a.conflict.length) {
+        materializeConflicts(a.conflict, flatDir, contentDir);
+        console.log(`   ${a.conflict.length} 个冲突需人工处理：node content-sync.js resolve（或按上面的 code --diff 合并）`);
+      }
       return;
     }
     console.log(`本地待同步差异 ${rows.length} 个（扁平 ↔ content/，不含冲突）：`);
@@ -883,26 +908,22 @@ function cli() {
       console.log('      查看  : code --diff "' + r.fp + '" "' + (r.cp || '/dev/null') + '"');
     }
     if (a.conflict.length) {
-      console.log(`\n⚠️ 另有 ${a.conflict.length} 个冲突不属待同步，请先 node content-sync.js resolve 处理：`, a.conflict);
+      console.log(`\n⚠️ 另有 ${a.conflict.length} 个冲突不属待同步：`);
+      materializeConflicts(a.conflict, flatDir, contentDir);
+      console.log('   先 node content-sync.js resolve 处理（或按上面的 code --diff 合并）');
     }
   } else if (cmd === 'conflicts') {
     const a = analyzePublish(flatDir, contentDir, repo);
     if (!a.conflict.length) {
       console.log('无冲突：内容树与扁平仓库没有“两侧各自改同一页”的情况。');
     } else {
-      const c = writeConflictDiffs(a.conflict, flatDir, contentDir);
-      console.log(`共 ${a.conflict.length} 个冲突，已生成 diff 到：${c.dir}`);
-      for (const f of c.files) {
-        console.log('  ' + f.name);
-        console.log('    diff : ' + (f.diff || '（二进制，无文本 diff）'));
-        console.log('    打开 : code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"');
-      }
-      console.log('总览: ' + path.join(c.dir, 'index.md'));
+      console.log(`共 ${a.conflict.length} 个冲突：`);
+      materializeConflicts(a.conflict, flatDir, contentDir, { maxList: 99 });
     }
   } else if (cmd === 'resolve') {
     resolveConflictsInteractive(flatDir, contentDir, repo);
   } else {
-    console.log('用法: node content-sync.js mirror|flatten|status|diff|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR] [--dry-run]');
+    console.log(`用法: node content-sync.js mirror|flatten|status|diff|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR] [--dry-run] [--force]`);
   }
 }
 
@@ -916,5 +937,5 @@ module.exports = {
   analyzePublish, applyPublish, refreshContentFromFlat, pendingLocalEdits,
   safeConflictName, defaultConflictDir, writeConflictDiffs, resolveConflictsInteractive,
   contentLayoutConflicts, layoutHints,
-  analyzeMirror, analyzeFlatten, localEdited, OVERWRITE_LABEL,
+  analyzeMirror, analyzeFlatten, localEdited, OVERWRITE_LABEL, materializeConflicts,
 };

@@ -351,6 +351,67 @@ test('CLI：flatten 的安全场景（仅内容树改）不拦截', () => {
   assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v2 content\n');
 });
 
+// ---------------------------------------------------------------------------
+// ⑥ 检测到冲突就自动落盘 diff（mirror / flatten / diff / resolve 都要有）
+// ---------------------------------------------------------------------------
+function conflictArtifacts(name) {
+  const dir = path.join(ROOT, '.content-sync', 'conflicts');
+  return { dir, diff: path.join(dir, cs.safeConflictName(name) + '.diff'), index: path.join(dir, 'index.md') };
+}
+
+test('CLI：mirror 拦截时自动生成冲突 diff 文件', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');           // 两侧各自改 → 冲突
+
+  const r = cli(['mirror']);
+  assert.strictEqual(r.status, 1);
+  const art = conflictArtifacts('A.mw');
+  assert.match(r.stdout, /已生成冲突 diff/);
+  assert.ok(fs.existsSync(art.diff), '应生成 <页>.diff');
+  assert.ok(fs.existsSync(art.index), '应生成 index.md');
+  const diff = fs.readFileSync(art.diff, 'utf8');
+  assert.match(diff, /v3 flat/);
+  assert.match(diff, /v2 content/);
+  assert.match(r.stdout, new RegExp(art.dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), '应打印冲突 diff 目录');
+  assert.match(r.stdout, /code --diff/);
+});
+
+test('CLI：flatten 拦截时自动生成冲突 diff 文件', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(path.join(FLAT, 'A.mw'), 'v2 flat\n');           // 扁平未提交改动 + content 也不同
+  write(contentPath('A.mw'), 'v3 content\n');
+
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 1);
+  const art = conflictArtifacts('A.mw');
+  assert.match(r.stdout, /已生成冲突 diff/);
+  assert.ok(fs.existsSync(art.diff));
+  assert.ok(fs.existsSync(art.index));
+});
+
+test('CLI：diff 遇到冲突也自动生成 diff 文件', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const r = cli(['diff']);
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /已生成冲突 diff/);
+  assert.ok(fs.existsSync(conflictArtifacts('A.mw').diff));
+});
+
+test('CLI：resolve 启动时也把冲突 diff 落盘', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  cli(['resolve'], 'q\n');
+  assert.ok(fs.existsSync(conflictArtifacts('A.mw').diff));
+  assert.ok(fs.existsSync(conflictArtifacts('A.mw').index));
+});
+
 // 全部跑完清理沙盒（失败时保留现场便于排查）
 after(() => {
   if (!process.env.KEEP_TEST_SANDBOX) fs.rmSync(ROOT, { recursive: true, force: true });

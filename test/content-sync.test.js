@@ -558,6 +558,63 @@ test('CLI：手工在两侧改成一致（未动 diff）→ 重跑命令自动�
   assert.match(r.stdout, /已无差异（两侧一致）/);
 });
 
+// ---------------------------------------------------------------------------
+// ⑧ 不假设用户装了 VS Code：没有 code 命令时也要能用（记事本 / nano / vim）
+// ---------------------------------------------------------------------------
+// 只把 git 放进 PATH：模拟「本机没有 VS Code（code）」的环境
+function cliWithoutCode(args, input, env = {}) {
+  const bin = path.join(ROOT, 'git-only-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const git = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  fs.rmSync(path.join(bin, 'git'), { force: true });
+  fs.symlinkSync(git, path.join(bin, 'git'));
+  return spawnSync(process.execPath, [BIN, ...args], {
+    env: { ...process.env, GWMW_CONFIG: CFG, PATH: bin, EDITOR: 'my-txt-editor', VISUAL: '', ...env },
+    input, encoding: 'utf8', timeout: 20000,
+  });
+}
+
+test('CLI：没有 code（VS Code）时冲突提示改为「改 diff + 编辑器」而非 code --diff', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const r = cliWithoutCode(['flatten']);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stdout, /改这里/);
+  assert.match(r.stdout, /\.diff/);
+  assert.match(r.stdout, /记事本 \/ nano \/ vim/);
+  assert.ok(!/code --diff/.test(r.stdout), '没有 code 时不应再提 code --diff');
+});
+
+test('CLI：没有 code 时 resolve 仍可用，并按 $EDITOR 给出打开命令', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const r = cliWithoutCode(['resolve'], 'q\n');
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /my-txt-editor/);            // 用 $EDITOR，而不是 code
+  assert.ok(!/code --diff/.test(r.stdout));
+  assert.deepStrictEqual(cs.analyzePublish(FLAT, CONTENT, FLAT).conflict, ['A.mw']);   // 未解决仍是冲突
+});
+
+test('CLI：没有 code 时改 diff 重跑同样自动写回两侧（纯文本编辑器流程）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const refused = cliWithoutCode(['flatten']);
+  assert.strictEqual(refused.status, 1);
+  // 等价于「记事本打开 .diff，全选替换成最终正文，保存」
+  write(conflictArtifacts('A.mw').diff, '纯文本编辑器合并结果\n');
+  const again = cliWithoutCode(['flatten']);
+  assert.strictEqual(again.status, 0, again.stdout + again.stderr);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), '纯文本编辑器合并结果\n');
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), '纯文本编辑器合并结果\n');
+});
+
 // 全部跑完清理沙盒（失败时保留现场便于排查）
 after(() => {
   if (!process.env.KEEP_TEST_SANDBOX) fs.rmSync(ROOT, { recursive: true, force: true });

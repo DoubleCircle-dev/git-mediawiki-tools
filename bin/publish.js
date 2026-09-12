@@ -505,10 +505,12 @@ async function main() {
       console.log('   原因: 这些页面在 content/ 与扁平仓库被各自修改，需先人工合并后再发布');
       if (pub.conflictDiffs && pub.conflictDiffs.length) {
         console.log(`   ⚠️ 已生成冲突 diff：${pub.conflictDir}`);
-        console.log('   用任何差异编辑器改对应 <页>.diff（写成本页最终正文）后重跑 publish，会自动复检并写回；');
-        console.log('   或直接在下面两份文件里改成一致（每行一条）：');
+        console.log('   用任何文本编辑器（记事本 / nano / vim 都行）改对应 <页>.diff：');
+        console.log('   整份替换成该页最终正文（别留 -、+、@@ 这些行），保存后重跑 publish 会自动复检并写回；');
+        console.log('   或直接把下面两份文件改成一致（想左右对照可用 code --diff / 任何差异工具）：');
         for (const f of pub.conflictDiffs) {
-          console.log('     code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"');
+          console.log('     扁平 ' + f.flat);
+          console.log('     内容 ' + (f.content || '（content/ 无此页）'));
         }
       } else {
         console.log('   处理: 在 content/ 对应文件与扁平仓库间取一致后，重新运行 node publish.js');

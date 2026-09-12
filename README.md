@@ -89,7 +89,7 @@ node bin/sync.js
 | `node bin/content-sync.js flatten` | 内容树 → 扁平仓库（一般 publish 已自动做）；会覆盖扁平仓库未提交改动时**先自动生成冲突 diff** 并要求 `--force` |
 | `node bin/content-sync.js check` | 往返一致性自检 |
 | `node bin/content-sync.js conflicts` | 列出冲突并生成 `<内容树同级>/.content-sync/conflicts/*.diff` + `index.md` |
-| `node bin/content-sync.js resolve` | 逐个解决冲突：打开 VS Code 差异编辑器，**两侧改到一致会自动进入下一项**（也可 f/c/s/q） |
+| `node bin/content-sync.js resolve` | 逐个解决冲突：停在命令行，**两侧改到一致会自动进入下一项**（也可 f/c/s/q） |
 | `node bin/content-sync.js apply` | 只做「改过 diff → 复检写回两侧」，不跑同步（有遗留冲突时退出码 1） |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
 | `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史 |
@@ -106,20 +106,23 @@ node bin/sync.js
 因此两者都可能覆盖对侧同名文件的改动（含未提交改动）。CLI 会在覆盖前列出清单并要求
 `--force`（不加则中止），同一份状态里连着跑两个方向也看不出干净结果。
 
-要合并两侧改动，**不需要任何 VS Code 插件**，也用不到交互：
+要合并两侧改动，**不需要 VS Code、也不需要装任何插件**，更用不到交互：
 
 1. 任意同步命令检测到冲突时会自动把统一差异写到
    `<内容树同级>/.content-sync/conflicts/<页>.diff`（+ `index.md` 总览）；
-2. 用你惯用的差异编辑器（或任何编辑器）**直接编辑那个 `.diff`**，把内容整份替换成
-   本页的**最终正文**，保存；
+2. 用**任何文本编辑器**（记事本 / nano / vim / 你的 IDE 都行）打开那个 `.diff`，
+   把内容**整份替换**成该页的**最终正文**（不要留 `-` `+` `@@` 这些 diff 符号），保存；
 3. 重跑刚才的命令（`flatten` / `mirror` / `publish` / `apply`）——工具发现 diff 被改过，
    于是复检（确认不会产生原冲突之外的新冲突）→ 写回**两侧**（扁平仓库 + content/）→ 继续执行。
 
 校验不通过（空文件 / 残留冲突标记 / 内容仍是 `@@` diff 结构 / 写回会引入新冲突）会**拒绝并回滚**，
 原有文件一字不动；已解决的 diff 归档为 `<页>.diff.done`。想先单独看看能不能合并，跑 `apply` 即可。
 
+想左右对照两份原文时（可选，不是必需）：装了 VS Code 用 `code --diff <扁平> <内容>`，
+否则用编辑器分别打开 `index.md` 里给出的 `扁平` / `内容` 两个路径即可。
+
 **只要检测到冲突，diff 就会自动落盘**：`status` / `conflicts` / `diff` / `resolve` / `mirror`（拦截时）、
-`flatten`（拦截时）、`publish`（中止时）都会写出上述产物，`index.md` 里含 `code --diff` 打开命令。
+`flatten`（拦截时）、`publish`（中止时）都会写出上述产物。
 
 - `content/pages/`：主命名空间页面（无前缀）。
 - `content/<命名空间>/`：各命名空间目录；标题里的 `/` 用真实子目录表示。

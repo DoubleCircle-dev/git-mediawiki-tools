@@ -20,9 +20,11 @@
  *   node bin/content-sync.js mirror|flatten|status|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR]
  *
  *   conflicts 命令在检测到“两侧各自改同一页”的冲突时，为每个冲突页生成统一差异
- *   （unified diff）到 <内容树同级>/.content-sync/conflicts/，便于在 VS Code
- *   差异编辑器（code --diff 扁平文件 内容文件）中查看并人工合并。
- *   resolve 命令逐个用 code --diff 打开冲突并停在命令行等你编辑：两侧改到一致
+ *   冲突时不自动合并，而是把「两侧各自改」的差异写成文本文件（unified diff）到
+ *   <内容树同级>/.content-sync/conflicts/：用任何文本编辑器（记事本 / nano / vim）
+ *   把 <页>.diff 整份替换成最终正文并保存，重跑同步命令即自动复检、写回两侧；
+ *   也支持在 diff／合并工具里对照（各命令会打印可选对照方式）。
+ *   resolve 命令逐个停在命令行等你处理：两侧改到一致就自动进入下一项。
  *   即自动推进，也可输入 f/c 直接由命令行采用一侧——可视化编辑与命令行修改同步进行。
  *   diff 命令列出“本地待同步差异”（内容树待回写 + 扁平新改动）并给出每文件
  *   code --diff 查看命令，供同步/发布前在差异编辑器里核对。
@@ -446,7 +448,7 @@ function analyzePublish(flatDir, contentDir, repo) {
 
 // ---------------------------------------------------------------------------
 // 冲突 diff 生成：检测到冲突时为每个冲突页产出 unified diff 文件，
-// 便于在 VS Code 差异编辑器（code --diff 扁平文件 内容文件）中查看并人工合并。
+// 便于用任何文本编辑器（或差异／合并工具）查看并人工合并。
 // 产物目录：<内容树同级>/.content-sync/conflicts（不在 content/ 也不在扁平仓库内，
 // 不会混入页面同步）。
 // ---------------------------------------------------------------------------
@@ -460,6 +462,11 @@ function safeConflictName(name) {
 // 默认冲突产物目录：内容树上一级目录下的 .content-sync/conflicts
 function defaultConflictDir(contentDir) {
   return path.join(path.resolve(contentDir, '..'), CONFLICT_SUBDIR);
+}
+
+// 某页的冲突 diff 路径（无论文件当前是否存在，用于打印「改这里」路径）
+function conflictDiffPath(contentDir, name, outDir) {
+  return path.join(outDir || defaultConflictDir(contentDir), safeConflictName(name) + '.diff');
 }
 
 // 上次生成的冲突清单（回执）：记录每个 diff 文件的指纹，用于下次复检
@@ -532,15 +539,28 @@ function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
     '以下页面在 content/（本地编辑工作区）与扁平仓库（线上来源）被**各自修改**，无法自动合并。',
     '每个 `*.diff` 均为 unified diff：`a/` = 扁平仓库版本，`b/` = content/ 版本。',
     '',
-    '解决方式（任选其一，使两侧一致后重跑 content-sync / publish）：',
-    '- 保留 **content/**（本地意图）：把扁平仓库文件改成与 content/ 一致；',
-    '- 保留**扁平仓库**（线上最新）：把 content/ 文件改成与扁平仓库一致；',
-    '- 或：`code --diff "<扁平文件>" "<内容文件>"` 打开 VS Code 差异编辑器手动合并。',
+    '## 用任何文本编辑器解决（记事本 / nano / vim 都行，不需要 VS Code）',
     '',
-    '**用外部差异编辑器解决（推荐，指令最少）**：直接编辑对应的 `<页>.diff`，',
-    '把它的内容整份替换成本页**最终正文**（不再含 `@@` / 冲突标记），保存；',
-    '然后重跑刚才的同步命令（`flatten` / `mirror` / `publish` / `apply`）：',
-    '工具会检测到 diff 被改过 → 复检（确认写回不会产生新冲突）→ 写回两侧 → 继续执行。',
+    '1. 打开该页对应的 `<页>.diff`（下面每节的 `diff :` 一行就是路径）；',
+    '2. **整份替换**成该页的**最终正文**——不要保留 `diff --git` / `---` / `+++` / `@@` 这些行，',
+    '   也不要把 `-`、`+` 前缀留在正文里；',
+    '3. 保存，然后**重跑刚才那条命令**（`flatten` / `mirror` / `publish` / `apply`）：',
+    '   工具发现 diff 被改过 → 复检（不会产生新冲突才写）→ 写回两侧 → 继续执行。',
+    '   （只想先看看能不能合并，就跑 `apply`：它只复检写回，不跑同步。）',
+    '',
+    '写回前的校验（不通过就拒绝并回滚，原文件一字不动）：空文件 / 残留冲突标记（`<<<<<<<` 等）/',
+    '内容看着仍是 `@@` diff 结构 / 写回会引入原来冲突之外的新冲突。已解决的 diff 归档为 `<页>.diff.done`。',
+    '',
+    '## 只采用某一侧（不用改 diff）',
+    '',
+    '- 保留 **content/**（本地意图）：把扁平仓库那个文件改成与 content/ 一致；',
+    '- 保留**扁平仓库**（线上最新）：把 content/ 那个文件改成与扁平仓库一致；',
+    '- 或 `node bin/content-sync.js resolve`，逐项输 `f`（扁平→内容）/ `c`（内容→扁平）。',
+    '',
+    '## 想左右对照两份原文',
+    '',
+    '- 装了 VS Code：`code --diff "<扁平文件>" "<内容文件>"`（也可用任何差异／合并工具）；',
+    '- 没装：用编辑器分别打开下面每节的 `扁平` / `内容` 两个路径即可。',
     '',
   ];
   for (const f of files) {
@@ -548,7 +568,7 @@ function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
     lines.push('- diff : ' + (f.diff ? '`' + f.diff + '`' : '（二进制，无法生成文本 diff，请直接以一侧覆盖）'));
     lines.push('- 扁平 : `' + f.flat + '`');
     lines.push('- 内容 : `' + (f.content || '（content/ 无此页，属删除类冲突）') + '`');
-    lines.push('- 打开 : `code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"`');
+    lines.push('- 对照 : `code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"`（可选，非必需）');
     lines.push('');
   }
   fs.writeFileSync(path.join(dir, 'index.md'), lines.join('\n'));
@@ -646,11 +666,48 @@ function pendingLocalEdits(flatDir, contentDir) {
 // 更少指令的做法见下面「改过 diff 就自动合并」：直接用任何外部差异编辑器改
 // .content-sync/conflicts/<页>.diff，保存后重跑同步命令即可。
 // ---------------------------------------------------------------------------
-function openVsCodeDiff(flatP, contentP) {
+// 本机可用编辑器（不假设 VS Code）：优先 $VISUAL / $EDITOR，其次常见命令
+function pickEditor() {
+  for (const k of ['VISUAL', 'EDITOR']) {
+    const v = (process.env[k] || '').trim();
+    if (v) return v;
+  }
+  for (const c of ['nano', 'vim', 'vi', 'notepad']) {
+    const r = spawnSync(c, ['--version'], { stdio: 'ignore' });
+    if (!r.error) return c;
+  }
+  return '';
+}
+
+// 版本检测（缓存）：本机是否有 VS Code 的 code 命令
+let _codeCli = null;
+function hasCodeCli() {
+  if (_codeCli === null) {
+    const r = spawnSync('code', ['--version'], { stdio: 'ignore' });
+    _codeCli = !r.error && r.status === 0;
+  }
+  return _codeCli;
+}
+
+// 打印「怎么改这个冲突」——一律不假设 VS Code：文本编辑器路径 / 可选对照命令
+function printEditHints(flatP, contentP, diffP) {
+  const ed = pickEditor();
+  if (diffP) {
+    console.log('  改这里（记事本 / nano / vim 均可）：' + diffP);
+    console.log('    整份替换成该页最终正文（别留 -、+、@@ 这些行），保存后重跑本命令即自动写回两侧');
+  }
+  const side = contentP && fs.existsSync(contentP) ? contentP : flatP;
+  console.log('  或直接编辑两侧文件（改到一致即自动放行）：' + side);
+  if (ed) console.log('    例如：' + ed + ' "' + (diffP || side) + '"');
+  if (hasCodeCli()) console.log('  左右对照（可选，VS Code）：code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
+}
+
+function openCodeDiff(flatP, contentP) {
+  if (!hasCodeCli()) return;                  // 没有 code 就只留上面的文字指引，不自动启动别的编辑器
   try {
     const p = spawn('code', ['--diff', flatP, contentP || '/dev/null'],
       { detached: true, stdio: 'ignore' });
-    p.on('error', () => console.log('   （未找到 code 命令，请手动执行上方 code --diff 命令打开差异编辑器）'));
+    p.on('error', () => { /* 已打印通用指引，忽略 */ });
     p.unref();
   } catch (e) { /* ignore */ }
 }
@@ -677,7 +734,7 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
       console.log('✅ 无冲突：内容树与扁平仓库没有“两侧各自改同一页”，可直接 publish。');
       rl.close(); return;
     }
-    console.log(`发现 ${todo.length} 个冲突：在 VS Code 差异编辑器里把两侧改成一致并保存，会**自动**进入下一项。`);
+    console.log(`发现 ${todo.length} 个冲突：把两侧改成一致（保存）会**自动**进入下一项。`);
     console.log('也可以直接输入：f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出。');
     const art = materializeConflicts(todo, flatDir, contentDir, { quiet: true });
     if (art) console.log(`冲突 diff 已写入：${art.dir}（总览 index.md）`);
@@ -696,8 +753,8 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
       console.log('\n[' + (i + 1) + '/' + todo.length + '] ' + name);
       console.log('  扁平 : ' + flatP);
       console.log('  内容 : ' + (contentP || '（无：content/ 已删此页，删除类冲突）'));
-      console.log('  打开 : code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
-      if (fs.existsSync(flatP) || cExists) openVsCodeDiff(flatP, contentP);
+      printEditHints(flatP, contentP, conflictDiffPath(contentDir, name));
+      if (fs.existsSync(flatP) || cExists) openCodeDiff(flatP, contentP);
       console.log('  （把两侧改到一致会自动继续；f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出）');
       let waitingShown = false;
       for (;;) {
@@ -825,8 +882,9 @@ function warnOverwrite(title, overwrite, force, flatDir, contentDir) {
   if (overwrite.length > 10) console.log(`   … 其余 ${overwrite.length - 10} 处`);
   materializeConflicts(overwrite.map((o) => o.name), flatDir, contentDir);
   if (!force) {
-    console.log('   要合并两侧改动：用任何差异编辑器改上面的 <页>.diff（写成本页最终正文）后重跑本命令，会自动复检并写回；');
-    console.log('   或 node content-sync.js resolve 逐项交互选择一侧；确认要放弃这些改动才加 --force。');
+    console.log('   处理：用任何文本编辑器（记事本 / nano / vim 都行）改上面的 <页>.diff——整份替换成最终正文，');
+    console.log('   保存后重跑本命令即自动复检并写回；也可 node content-sync.js resolve 逐项选一侧。');
+    console.log('   确认要放弃这些改动才加 --force。');
     return true;
   }
   console.log('   （--force：按上述覆盖继续）');
@@ -843,7 +901,11 @@ function materializeConflicts(names, flatDir, contentDir, opts = {}) {
   console.log(`⚠️ 已生成冲突 diff（${art.files.length} 个）：${art.dir}`);
   for (const f of art.files.slice(0, maxList)) {
     console.log(`   ${f.name}`);
-    console.log(`     查看 : code --diff "${f.flat}" "${f.content || '/dev/null'}"`);
+    console.log(`     改这里 : ${f.diff || '（二进制：请直接以一侧覆盖）'}`);
+    console.log(`             整份替换成该页最终正文（记事本 / nano / vim 都行），保存后重跑本命令即自动写回两侧`);
+    if (hasCodeCli()) {
+      console.log(`     对照  : code --diff "${f.flat}" "${f.content || '/dev/null'}"（可选）`);
+    }
   }
   if (art.files.length > maxList) {
     console.log(`   … 其余 ${art.files.length - maxList} 个见 index.md`);
@@ -1054,7 +1116,7 @@ function cli() {
     if (a.conflict.length) {
       const c = writeConflictDiffs(a.conflict, flatDir, contentDir);
       console.log(`  ⚠️ 已为 ${c.files.length} 个冲突生成 diff：${c.dir}`);
-      console.log(`    总览: ${path.join(c.dir, 'index.md')}（可用 code --diff 逐对打开差异编辑器合并）`);
+      console.log(`    总览: ${path.join(c.dir, 'index.md')}（改 <页>.diff 后重跑本命令即自动写回）`);
     }
     if (pend.length) console.log(`⚠️ 内容树有未发布改动: ${pend.length}`, pend.slice(0, 15));
   } else if (cmd === 'check') {
@@ -1083,7 +1145,7 @@ function cli() {
       console.log('无待同步差异：扁平仓库与 content/ 已一致。');
       if (a.conflict.length) {
         materializeConflicts(a.conflict, flatDir, contentDir);
-        console.log(`   ${a.conflict.length} 个冲突需人工处理：node content-sync.js resolve（或按上面的 code --diff 合并）`);
+        console.log(`   ${a.conflict.length} 个冲突需人工处理：改 <页>.diff 后重跑本命令（或 node content-sync.js resolve）`);
       }
       return;
     }
@@ -1092,12 +1154,14 @@ function cli() {
       console.log('\n  [' + r.side + '] ' + r.name);
       console.log('      扁平  : ' + r.fp);
       console.log('      内容  : ' + (r.cp || '（content/ 无此页）'));
-      console.log('      查看  : code --diff "' + r.fp + '" "' + (r.cp || '/dev/null') + '"');
+      console.log('      查看  : 任何编辑器打开这两个路径（想左右对照：code --diff 或其它差异工具）');
+      console.log('              ' + r.fp);
+      console.log('              ' + (r.cp || '（content/ 无此页）'));
     }
     if (a.conflict.length) {
       console.log(`\n⚠️ 另有 ${a.conflict.length} 个冲突不属待同步：`);
       materializeConflicts(a.conflict, flatDir, contentDir);
-      console.log('   先 node content-sync.js resolve 处理（或按上面的 code --diff 合并）');
+      console.log('   先改 <页>.diff（或两侧文件改成一致），再重跑本命令自动复检写回；也可 node content-sync.js resolve');
     }
   } else if (cmd === 'conflicts') {
     const a = analyzePublish(flatDir, contentDir, repo);

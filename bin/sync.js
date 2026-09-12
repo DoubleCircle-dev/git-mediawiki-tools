@@ -92,6 +92,19 @@ async function main() {
 
   console.log(`===== 同步 ${cfg.wikiName} → 本地（来源: ${REMOTE}）=====`);
 
+  // 0) 若冲突已在 VS Code 合并编辑器里解决（工作树不再有 <<<<<<< 标记）：同步回 content/ 并 git add
+  //    —— VS Code 里表现为「合并更改」→「暂存更改」；仍带标记的则中止，避免带着冲突去 fetch/rebase。
+  contentSync.finishGitMerges(REPO_DIR, CONTENT_DIR, REPO_DIR);
+  contentSync.autoApplyEditedDiffs(REPO_DIR, CONTENT_DIR, REPO_DIR);
+  const stillUnmerged = contentSync.listUnmergedPaths(REPO_DIR);
+  if (stillUnmerged.length) {
+    console.log('');
+    console.log(`❌ 还有 ${stillUnmerged.length} 个冲突未解决（工作树带 <<<<<<< 标记）：${stillUnmerged.join('、')}`);
+    console.log('   在 VS Code 源代码管理 →「合并更改」→ 合并编辑器里解决后重跑本命令；');
+    console.log('   放弃这次合并：node bin/content-sync.js git-merge --abort');
+    process.exit(1);
+  }
+
   // 拉取前记录 content/ 是否有尚未回写的本地改动（避免拉取后整理时被覆盖）
   const contentReady = fs.existsSync(CONTENT_DIR);
   const prePending = contentReady ? contentSync.pendingLocalEdits(REPO_DIR, CONTENT_DIR) : [];

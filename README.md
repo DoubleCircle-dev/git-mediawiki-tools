@@ -129,8 +129,9 @@ node bin/sync.js
    （或设 `"git.mergeEditor": true` 后双击文件直接进 3 方合并编辑器）
 2. 合并器里 **Current = 扁平仓库 / 线上**，**Incoming = content/ 本地** → 选 Accept Current / Incoming
    → 点**「完成合并」**
-3. 回来**重跑刚才那条命令**（`flatten` / `publish`，或只复检的 `apply`）：工具会把结果同步回
-   `content/`、并清掉 index 里的冲突条目（相当于 `git add`）
+3. 回来**重跑那条命令**（`flatten` / `publish` / `sync`，或只复检的 `apply`）：工具会把结果
+   `git add` 进暂存区 —— VS Code 里就是 **「合并更改」→「暂存更改」**（同时同步回 `content/`），
+   之后你可以在 Git 面板直接提交/推送，或让它继续跑同步
 
 ```bash
 node bin/content-sync.js git-merge        # 也可以手动执行：把当前冲突写进 git
@@ -138,7 +139,10 @@ node bin/content-sync.js git-merge --abort # 放弃这次合并：还原扁平�
 node bin/content-sync.js apply            # 只复检写回，不跑同步（有遗留冲突时退出码 1）
 ```
 
-> - 只关标签页、不点「完成合并」＝仍未解决；重跑命令只会提示还剩哪些。
+> - 只关标签页、不点「完成合并」＝仍未解决；重跑命令只会提示还剩哪些（`sync` 会直接中止，
+>   不会带着 `<<<<<<<` 去 fetch/rebase）。
+> - 点击「完成合并」后**不必手动 stage**：下次跑任何同步/发布命令时，工具会做 `git add`
+>   （若编辑器只保存没 stage，也一样会补上）。
 > - **没有解决之前不会提交**：`publish` 会中止（`git` 本身也拒绝提交 unmerged 的路径），
 >   不会把 `<<<<<<<` 标记推到线上。
 > - `--force` 是「以某一侧为准」的语义：`mirror --force` 按扁平/线上采用、`flatten --force` 按

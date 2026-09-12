@@ -584,6 +584,7 @@ test('CLI：手工把结果写进扁平文件（不 git add）→ 重跑命令�
   assert.match(r.stdout, /git 合并冲突已解决 1 个/);
   assert.strictEqual(fs.readFileSync(cp, 'utf8'), '手工合并结果\n');   // 已同步回 content/
   assert.strictEqual(unmerged(), '');
+  assert.deepStrictEqual(staged(), ['A.mw']);
 });
 
 // ---------------------------------------------------------------------------
@@ -651,6 +652,12 @@ function unmerged() {
   return sh('git', ['diff', '--name-only', '--diff-filter=U'], FLAT).trim();
 }
 
+// 已暂存（porcelain 第一列 M、第二列空格）＝ VS Code 的「暂存更改」区
+function staged() {
+  return sh('git', ['status', '--porcelain'], FLAT)
+    .split('\n').filter((l) => /^[MARD] /.test(l)).map((l) => l.slice(3).trim()).sort();
+}
+
 test('git-merge：把冲突写进 git（UU + 工作树带标记），未解决时不会提交', () => {
   baseline({ 'A.mw': 'v1\n' });
   const cp = contentPath('A.mw');
@@ -691,8 +698,10 @@ test('git-merge：合并编辑器解决（写结果 + git add）后，重跑命�
   const r = cli(['flatten']);
   assert.strictEqual(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /git 合并冲突已解决 1 个/);
+  assert.match(r.stdout, /暂存更改/);
   assert.strictEqual(fs.readFileSync(cp, 'utf8'), '合并结果（来自合并编辑器）\n');
   assert.strictEqual(unmerged(), '');
+  assert.deepStrictEqual(staged(), ['A.mw'], '解决后应进入暂存区（合并更改 → 暂存更改）');
   assert.deepStrictEqual(cs.analyzePublish(FLAT, CONTENT, FLAT).conflict, []);
 });
 
@@ -708,6 +717,7 @@ test('git-merge：只写结果、没 git add（未 stage）时收尾也能识别
   assert.strictEqual(r.status, 0, r.stdout + r.stderr);
   assert.strictEqual(fs.readFileSync(cp, 'utf8'), '只保存未 stage 的结果\n');
   assert.strictEqual(unmerged(), '');
+  assert.deepStrictEqual(staged(), ['A.mw'], '工具应补上 git add（进入暂存区）');
 });
 
 test('git-merge --abort：还原扁平侧工作树并清掉 unmerged，content/ 不受影响', () => {

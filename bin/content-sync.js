@@ -1267,7 +1267,8 @@ function finishGitMerges(flatDir, contentDir, repo, opts = {}) {
 
   if (!quiet) {
     if (res.done.length) {
-      console.log(`🧩 git 合并冲突已解决 ${res.done.length} 个：已同步回 content/ 并清除冲突条目`);
+      console.log(`🧩 git 合并冲突已解决 ${res.done.length} 个：已同步回 content/ 并 git add`
+        + `（VS Code 里：合并更改 → 暂存更改）`);
       for (const d of res.done) console.log(`   ✔ ${d.name} → ${d.content || '（content/ 未映射？）'}`);
     }
     if (res.pending.length) {

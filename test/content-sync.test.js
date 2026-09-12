@@ -19,7 +19,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 
 const BIN = path.join(__dirname, '..', 'bin', 'content-sync.js');
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-test-'));
@@ -86,14 +86,30 @@ function contentPath(flat, allMw) {
 }
 
 // 调 CLI（默认注入一个假 `code`，避免 resolve 真的打开差异编辑器）
-function cli(args, input, timeout = 20000) {
+function cli(args, input, timeout = 20000, codeScript) {
   const stub = path.join(ROOT, 'stub-bin');
   fs.mkdirSync(stub, { recursive: true });
-  fs.writeFileSync(path.join(stub, 'code'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(stub, 'code'), codeScript || '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   return spawnSync('node', [BIN, ...args], {
     env: { ...process.env, GWMW_CONFIG: CFG, PATH: `${stub}:${process.env.PATH}` },
     input, encoding: 'utf8', timeout,
   });
+}
+
+// 异步跑 CLI（用于「运行中从外部改文件」的用例：resolve 会自动推进）
+function cliSpawn(args) {
+  const stub = path.join(ROOT, 'stub-bin');
+  fs.mkdirSync(stub, { recursive: true });
+  fs.writeFileSync(path.join(stub, 'code'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const child = spawn('node', [BIN, ...args], {
+    env: { ...process.env, GWMW_CONFIG: CFG, PATH: `${stub}:${process.env.PATH}` },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const done = new Promise((resolve) => child.on('close', (code) => resolve({ code, out })));
+  return { child, done, output: () => out };
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +426,136 @@ test('CLI：resolve 启动时也把冲突 diff 落盘', () => {
   cli(['resolve'], 'q\n');
   assert.ok(fs.existsSync(conflictArtifacts('A.mw').diff));
   assert.ok(fs.existsSync(conflictArtifacts('A.mw').index));
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ 更少指令：编辑到一致自动推进；改过 diff 后重跑命令自动复检写回
+// ---------------------------------------------------------------------------
+test('CLI：resolve 中把两侧改成一致 → 自动推进（无需回车）', async () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const { done, output } = cliSpawn(['resolve']);
+  await new Promise((r) => setTimeout(r, 900));   // 等它进入等待状态
+  write(cp, 'v3 flat\n');                        // 等价于在差异编辑器里把两侧改一致
+  const res = await Promise.race([
+    done, new Promise((r) => setTimeout(() => r({ code: null, out: output() }), 8000)),
+  ]);
+  assert.strictEqual(res.code, 0, '应自动走完并退出');
+  assert.match(res.out, /两侧已一致，进入下一项/);
+  assert.deepStrictEqual(cs.analyzePublish(FLAT, CONTENT, FLAT).conflict, []);
+});
+
+test('CLI：改过 diff 后重跑 flatten → 自动复检写回两侧并放行（无需 --force）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  const refused = cli(['flatten']);                 // 第一次：拦截并生成 diff
+  assert.strictEqual(refused.status, 1);
+  const art = conflictArtifacts('A.mw');
+  assert.ok(fs.existsSync(art.diff));
+
+  // 用外部差异编辑器「解决」：把 diff 文件改成本页最终正文
+  write(art.diff, 'v4 merged\n');
+  const again = cli(['flatten']);
+  assert.strictEqual(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /被人工修改过：已复检并写回两侧/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v4 merged\n');
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v4 merged\n');
+  assert.deepStrictEqual(cs.analyzePublish(FLAT, CONTENT, FLAT).conflict, []);
+  assert.ok(!fs.existsSync(art.diff), '解决后 diff 应出账并归档');
+  assert.ok(fs.existsSync(art.diff + '.done'), '归档为 <页>.diff.done');
+});
+
+test('CLI：diff 未改动 → 仍拦截，不自动放行', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  assert.strictEqual(cli(['flatten']).status, 1);
+  const again = cli(['flatten']);                    // diff 原样没动
+  assert.strictEqual(again.status, 1);
+  assert.match(again.stdout, /仍有 1 个冲突未解决/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
+});
+
+test('CLI：人工结果含冲突标记/diff 结构 → 拒绝写回且两侧文件不被改坏', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+
+  assert.strictEqual(cli(['flatten']).status, 1);
+  const art = conflictArtifacts('A.mw');
+  write(art.diff, '<<<<<<< flat\nv3 flat\n=======\nv2 content\n>>>>>>> content\n');
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 1);
+  assert.match(r.stdout, /还留有冲突标记/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v2 content\n');
+  write(art.diff, '@@ -1 +1 @@\n-v3 flat\n+v2 content\n');
+  const r2 = cli(['flatten']);
+  assert.strictEqual(r2.status, 1);
+  assert.match(r2.stdout, /仍是未处理的 diff/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
+});
+
+test('CLI：多个冲突只改了一个 → 已改的写回放行，未改的仍拦截且不受影响', () => {
+  baseline({ 'A.mw': 'v1\n', 'B.mw': 'v1\n' });
+  for (const n of ['A.mw', 'B.mw']) {
+    write(contentPath(n), 'v2 content\n');
+    write(path.join(FLAT, n), 'v3 flat\n');
+  }
+  assert.strictEqual(cli(['flatten']).status, 1);
+  write(conflictArtifacts('A.mw').diff, 'merged A\n');   // 只解决 A
+
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 1);                       // B 仍未解决 → 仍拦截
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'merged A\n');
+  assert.strictEqual(fs.readFileSync(contentPath('A.mw'), 'utf8'), 'merged A\n');
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'B.mw'), 'utf8'), 'v3 flat\n');   // B 保持原样
+  assert.strictEqual(fs.readFileSync(contentPath('B.mw'), 'utf8'), 'v2 content\n');
+
+  write(conflictArtifacts('B.mw').diff, 'merged B\n');   // 再解决 B → 放行
+  const ok = cli(['flatten']);
+  assert.strictEqual(ok.status, 0, ok.stdout + ok.stderr);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'B.mw'), 'utf8'), 'merged B\n');
+  assert.strictEqual(fs.readFileSync(contentPath('B.mw'), 'utf8'), 'merged B\n');
+});
+
+test('CLI：apply 只复检不跑同步（有遗留冲突则退出码 1）', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  write(contentPath('A.mw'), 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  assert.strictEqual(cli(['flatten']).status, 1);
+
+  const pending = cli(['apply']);
+  assert.strictEqual(pending.status, 1);
+  assert.match(pending.stdout, /仍有 1 个冲突未解决/);
+
+  write(conflictArtifacts('A.mw').diff, 'merged\n');
+  const done = cli(['apply']);
+  assert.strictEqual(done.status, 0, done.stdout + done.stderr);
+  assert.match(done.stdout, /冲突均已解决/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'merged\n');
+  assert.strictEqual(fs.readFileSync(contentPath('A.mw'), 'utf8'), 'merged\n');
+});
+
+test('CLI：手工在两侧改成一致（未动 diff）→ 重跑命令自动放行', () => {
+  baseline({ 'A.mw': 'v1\n' });
+  const cp = contentPath('A.mw');
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, 'A.mw'), 'v3 flat\n');
+  assert.strictEqual(cli(['flatten']).status, 1);
+
+  write(cp, 'v3 flat\n');                        // 直接在两份真实文件里合并
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /已无差异（两侧一致）/);
 });
 
 // 全部跑完清理沙盒（失败时保留现场便于排查）

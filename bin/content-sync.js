@@ -462,15 +462,36 @@ function defaultConflictDir(contentDir) {
   return path.join(path.resolve(contentDir, '..'), CONFLICT_SUBDIR);
 }
 
+// 上次生成的冲突清单（回执）：记录每个 diff 文件的指纹，用于下次复检
+const CONFLICT_STATE = 'state.json';
+
+function readConflictState(dir) {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(dir, CONFLICT_STATE), 'utf8'));
+    return { entries: Array.isArray(s.entries) ? s.entries : [] };
+  } catch (e) { return { entries: [] }; }
+}
+
+function writeConflictState(dir, entries) {
+  const f = path.join(dir, CONFLICT_STATE);
+  if (!entries || !entries.length) { fs.rmSync(f, { force: true }); return; }
+  fs.writeFileSync(f, JSON.stringify({ generatedAt: new Date().toISOString(), entries }, null, 2) + '\n');
+}
+
 // 为一批冲突扁平名生成 diff 产物：
 //   <安全名>.diff   unified diff（a=扁平仓库/线上，b=content/ 本地编辑）；二进制图不生成
 //   index.md        总览：真实路径与可直接运行的 code --diff 打开命令
-// 返回 { dir, files: [{ name, diff, flat, content }] }
+//   state.json      回执：每个 diff 的指纹（下次复检「是否被人工修改过」）
+// 已被人手修改过的 diff 不会被覆盖，只登记回执并在返回值里报出 keptEdited。
+// 返回 { dir, files: [{ name, diff, flat, content }], keptEdited: [name] }
 function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
   const dir = outDir || defaultConflictDir(contentDir);
   fs.mkdirSync(dir, { recursive: true });
+  const prevBy = new Map(readConflictState(dir).entries.map((e) => [e.name, e]));
   const byFlat = contentNameMap(contentDir).byFlat;
   const files = [];
+  const entries = [];
+  const keptEdited = [];
   for (const name of conflictNames) {
     const flatP = path.join(flatDir, name);
     const rel = byFlat.get(name);
@@ -485,13 +506,25 @@ function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
       const diffText = ((r.stdout || '') + (r.stderr || '')).trim();
       if (diffText) {
         const diffP = path.join(dir, safeConflictName(name) + '.diff');
-        fs.writeFileSync(diffP, diffText + '\n');
+        const prev = prevBy.get(name);
+        const nowSha = fs.existsSync(diffP) ? sha1File(diffP) : null;
+        // 上次登记过指纹、且磁盘上已变样 ⇒ 人工改过：保留别人的版本，不覆盖
+        const edited = !!(prev && prev.diffSha1 && nowSha && nowSha !== prev.diffSha1);
+        if (edited) keptEdited.push(name);
+        else fs.writeFileSync(diffP, diffText + '\n');
         files.push({ name, diff: diffP, flat: flatP, content: contentP });
+        entries.push({
+          name,
+          diff: path.basename(diffP),
+          // 人工改过时保留旧指纹，下次仍能识别出「这份是人工版」
+          diffSha1: edited ? prev.diffSha1 : sha1File(diffP),
+        });
+        continue;
       }
-    } else {
-      files.push({ name, diff: null, flat: flatP, content: contentP }); // 二进制：仅登记
     }
+    files.push({ name, diff: null, flat: flatP, content: contentP }); // 二进制/无文本差异：仅登记
   }
+  writeConflictState(dir, entries);
   // 总览 index.md
   const lines = [
     '# 内容同步冲突（' + new Date().toISOString() + '）',
@@ -504,6 +537,11 @@ function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
     '- 保留**扁平仓库**（线上最新）：把 content/ 文件改成与扁平仓库一致；',
     '- 或：`code --diff "<扁平文件>" "<内容文件>"` 打开 VS Code 差异编辑器手动合并。',
     '',
+    '**用外部差异编辑器解决（推荐，指令最少）**：直接编辑对应的 `<页>.diff`，',
+    '把它的内容整份替换成本页**最终正文**（不再含 `@@` / 冲突标记），保存；',
+    '然后重跑刚才的同步命令（`flatten` / `mirror` / `publish` / `apply`）：',
+    '工具会检测到 diff 被改过 → 复检（确认写回不会产生新冲突）→ 写回两侧 → 继续执行。',
+    '',
   ];
   for (const f of files) {
     lines.push('## ' + f.name);
@@ -514,7 +552,7 @@ function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
     lines.push('');
   }
   fs.writeFileSync(path.join(dir, 'index.md'), lines.join('\n'));
-  return { dir, files };
+  return { dir, files, keptEdited };
 }
 
 // ---------------------------------------------------------------------------
@@ -601,10 +639,12 @@ function pendingLocalEdits(flatDir, contentDir) {
 }
 
 // ---------------------------------------------------------------------------
-// resolve：交互式可视化解决冲突（可视化编辑 + 命令行同步推进）
+// resolve：交互式解决冲突（打开差异编辑器 + 命令行同步推进）
 // 逐个冲突自动用 `code --diff 扁平 内容` 打开 VS Code 差异编辑器，脚本停在命令行
-// 等你：把两侧改成一致（保存即可）后回车即自动进入下一项；也可直接输入 f/c 由
-// 命令行采用一侧，或 s 跳过 / q 退出。
+// 等你：把两侧改成一致（保存即可）后自动进入下一项；也可直接输入 f/c 由命令行
+// 采用一侧，或 s 跳过 / q 退出。
+// 更少指令的做法见下面「改过 diff 就自动合并」：直接用任何外部差异编辑器改
+// .content-sync/conflicts/<页>.diff，保存后重跑同步命令即可。
 // ---------------------------------------------------------------------------
 function openVsCodeDiff(flatP, contentP) {
   try {
@@ -615,10 +655,19 @@ function openVsCodeDiff(flatP, contentP) {
   } catch (e) { /* ignore */ }
 }
 
+function writeIfChanged(data, file) {
+  const next = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  if (fs.existsSync(file) && fs.readFileSync(file).equals(next)) return false;
+  fs.writeFileSync(file, next);
+  return true;
+}
+
 function resolveConflictsInteractive(flatDir, contentDir, repo) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = (q) => new Promise((res) => rl.question(q, res));
+  const pending = [];                       // 用户输入行队列（非阻塞，边等文件变化边收按键）
+  rl.on('line', (l) => pending.push(String(l).trim().toLowerCase()));
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   (async () => {
     const byFlat = contentNameMap(contentDir).byFlat;
@@ -628,8 +677,8 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
       console.log('✅ 无冲突：内容树与扁平仓库没有“两侧各自改同一页”，可直接 publish。');
       rl.close(); return;
     }
-    console.log(`发现 ${todo.length} 个冲突，逐个在 VS Code 差异编辑器解决（命令行同步推进）：`);
-    console.log('提示：在差异编辑器把两侧改成一致并保存后回车；或直接输入 f/c 由命令行采用一侧。');
+    console.log(`发现 ${todo.length} 个冲突：在 VS Code 差异编辑器里把两侧改成一致并保存，会**自动**进入下一项。`);
+    console.log('也可以直接输入：f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出。');
     const art = materializeConflicts(todo, flatDir, contentDir, { quiet: true });
     if (art) console.log(`冲突 diff 已写入：${art.dir}（总览 index.md）`);
     let i = 0;
@@ -649,14 +698,18 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
       console.log('  内容 : ' + (contentP || '（无：content/ 已删此页，删除类冲突）'));
       console.log('  打开 : code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
       if (fs.existsSync(flatP) || cExists) openVsCodeDiff(flatP, contentP);
+      console.log('  （把两侧改到一致会自动继续；f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出）');
+      let waitingShown = false;
       for (;;) {
-        const ok = consistentOf(flatP, contentP);
-        const ans = (await ask(ok
-          ? '  ✓ 两侧已一致，回车进入下一项 > '
-          : '  [回车]检查是否已改一致  f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出 > ')).trim().toLowerCase();
-        if (!ans || ans === 'ok' || ans === 'y') {
-          if (ok) { i++; break; }
-          console.log('  ⚠️ 两侧还不一致：在差异编辑器改到一致并保存后回车；或输入 f/c 直接采用一侧。');
+        await sleep(300);
+        if (consistentOf(flatP, contentP)) { console.log('  ✓ 两侧已一致，进入下一项'); i++; break; }
+        const ans = pending.shift();
+        if (ans === undefined) {
+          if (!waitingShown) { console.log('  …等待编辑中（也可以直接输入 f/c/s/q）'); waitingShown = true; }
+          continue;
+        }
+        if (ans === '' || ans === 'ok' || ans === 'y') {
+          console.log('  ⚠️ 两侧还不一致：把两侧改到一致会自动继续；或输入 f/c 直接采用一侧。');
           continue;
         }
         if (ans === 'f') {
@@ -683,7 +736,7 @@ function resolveConflictsInteractive(flatDir, contentDir, repo) {
         }
         if (ans === 's') { console.log('  已跳过（保留冲突）。'); i++; break; }
         if (ans === 'q') { console.log('  退出。'); rl.close(); return; }
-        console.log('  未知输入（回车 / f / c / s / q）。');
+        console.log('  未知输入（直接编辑文件到一致会自动继续；f=扁平→内容 / c=内容→扁平 / s / q）');
       }
     }
     a = analyzePublish(flatDir, contentDir, repo);
@@ -772,7 +825,8 @@ function warnOverwrite(title, overwrite, force, flatDir, contentDir) {
   if (overwrite.length > 10) console.log(`   … 其余 ${overwrite.length - 10} 处`);
   materializeConflicts(overwrite.map((o) => o.name), flatDir, contentDir);
   if (!force) {
-    console.log('   确认要放弃这些改动请加 --force；要合并两侧改动：conflicts → resolve（或用上面的 diff）');
+    console.log('   要合并两侧改动：用任何差异编辑器改上面的 <页>.diff（写成本页最终正文）后重跑本命令，会自动复检并写回；');
+    console.log('   或 node content-sync.js resolve 逐项交互选择一侧；确认要放弃这些改动才加 --force。');
     return true;
   }
   console.log('   （--force：按上述覆盖继续）');
@@ -795,7 +849,134 @@ function materializeConflicts(names, flatDir, contentDir, opts = {}) {
     console.log(`   … 其余 ${art.files.length - maxList} 个见 index.md`);
   }
   console.log(`   总览 : ${path.join(art.dir, 'index.md')}`);
+  if (art.keptEdited && art.keptEdited.length) {
+    console.log(`   注意 : ${art.keptEdited.join('、')} 的 .diff 已被你修改过，本次未覆盖（重跑命令即自动复检写回）`);
+  }
   return art;
+}
+
+// ---------------------------------------------------------------------------
+// 「改过 diff 就自动合并」：上次生成的冲突 diff 被人工修改（用任何外部差异编辑器
+// 或直接编辑保存）后，重跑同步命令时先复检：
+//   1) 把改后的 diff 内容当作该页**最终正文**；
+//   2) 校验：非空、文本、无冲突标记、不再像未处理的 diff；
+//   3) 写回两侧（扁平仓库 + content/）后重新盘点冲突，必须
+//      「不出现原来冲突之外的新冲突」，否则回滚、保持原样；
+//   4) 通过后本次同步命令继续执行（不再要求 --force）。
+// 两侧已被人手改到一致、或 diff 已被删掉，也一并复检放行。
+// ---------------------------------------------------------------------------
+const MERGE_MARKER_RE = /^(<{7}|={7}|>{7})/m;
+const RAW_DIFF_RE = /^(diff --git |--- a\/|\+\+\+ b\/|@@ )/m;
+
+// 当前所有「会被覆盖/冲突」的文件名集合（跨 publish/mirror/flatten 三种视角）
+function conflictInventory(flatDir, contentDir, repo) {
+  const names = new Set();
+  for (const n of analyzePublish(flatDir, contentDir, repo).conflict) names.add(n);
+  for (const o of analyzeMirror(flatDir, contentDir).overwrite) names.add(o.name);
+  for (const o of analyzeFlatten(flatDir, contentDir, repo).overwrite) names.add(o.name);
+  const layout = contentLayoutConflicts(contentDir);
+  for (const d of layout.dup) names.add('布局:' + d.flat);
+  for (const r of layout.nonIndex.concat(layout.loneIndex)) names.add('布局:' + r);
+  return names;
+}
+
+// 校验人工结果能否安全写回；返回 null 表示通过，否则返回拒绝原因
+function mergeResultProblem(text) {
+  if (/^\s*$/.test(text)) return '文件是空的（如确实要清空该页，请写入一个换行，或用 resolve 显式选一侧）';
+  if (text.indexOf('\u0000') !== -1) return '内容含 NUL 字节（二进制），无法写回文本页';
+  if (MERGE_MARKER_RE.test(text)) return '还留有冲突标记（<<<<<<< / ======= / >>>>>>>），合并尚未完成';
+  if (RAW_DIFF_RE.test(text)) return '内容仍是未处理的 diff（含 @@ 或 --- a/ 结构），请写入合并后的页面正文';
+  return null;
+}
+
+// 把最终正文写回两侧，返回快照（用于回滚）
+function writeMergedToBothSides(name, text, flatDir, contentDir) {
+  const rel = contentNameMap(contentDir).byFlat.get(name);
+  const targets = [path.join(flatDir, name)];
+  if (rel) targets.push(path.join(contentDir, rel));
+  const snapshot = [];
+  for (const p of targets) {
+    const had = fs.existsSync(p);
+    snapshot.push({ p, had, data: had ? fs.readFileSync(p) : null });
+    writeIfChanged(text, p);
+  }
+  return snapshot;
+}
+
+function restoreSnapshot(snapshot) {
+  for (const s of snapshot) {
+    if (s.had) fs.writeFileSync(s.p, s.data);
+    else fs.rmSync(s.p, { force: true });
+  }
+}
+
+// 把已解决的冲突 diff 归档（保留内容供追溯，但不再参与复检）
+function archiveConflictDiff(diffP) {
+  if (!diffP || !fs.existsSync(diffP)) return null;
+  const done = diffP + '.done';
+  try { fs.renameSync(diffP, done); return done; } catch (e) { return null; }
+}
+
+// 复检上次的冲突回执：diff 被改过 → 写回两侧；返回各分类结果
+function autoApplyEditedDiffs(flatDir, contentDir, repo, opts = {}) {
+  const quiet = !!opts.quiet;
+  const dir = opts.outDir || defaultConflictDir(contentDir);
+  const before = conflictInventory(flatDir, contentDir, repo);
+  const res = { dir, applied: [], failed: [], resolved: [], pending: [] };
+  const entries = readConflictState(dir).entries;
+  if (!entries.length) return res;
+
+  const kept = [];
+  for (const e of entries) {
+    const flatP = path.join(flatDir, e.name);
+    const rel = contentNameMap(contentDir).byFlat.get(e.name);
+    const contentP = rel ? path.join(contentDir, rel) : null;
+    const flatSha = fs.existsSync(flatP) ? sha1File(flatP) : null;
+    const contentSha = contentP && fs.existsSync(contentP) ? sha1File(contentP) : null;
+
+    if (flatSha !== null && flatSha === contentSha) {   // 复检：两侧已无差异
+      archiveConflictDiff(e.diff ? path.join(dir, e.diff) : null);
+      res.resolved.push(e.name); continue;
+    }
+    const diffP = e.diff ? path.join(dir, e.diff) : null;
+    if (!diffP || !fs.existsSync(diffP)) { res.pending.push(e.name); kept.push(e); continue; }
+    if (!e.diffSha1 || sha1File(diffP) === e.diffSha1) { res.pending.push(e.name); kept.push(e); continue; }
+
+    // diff 被人工改过 → 当成本页最终正文
+    const text = fs.readFileSync(diffP, 'utf8');
+    const why = mergeResultProblem(text);
+    if (why) { res.failed.push({ name: e.name, why }); kept.push(e); continue; }
+    const snapshot = writeMergedToBothSides(e.name, text, flatDir, contentDir);
+    const added = [...conflictInventory(flatDir, contentDir, repo)].filter((n) => !before.has(n));
+    if (added.length) {
+      restoreSnapshot(snapshot);   // 出现原来冲突之外的新冲突 → 回滚，绝不写坏
+      res.failed.push({ name: e.name, why: `写回会产生新冲突：${added.join('、')}（已回滚）` });
+      kept.push(e); continue;
+    }
+    res.applied.push({ name: e.name, flat: flatP, content: contentP, done: archiveConflictDiff(diffP) });
+  }
+  writeConflictState(dir, kept);   // 已解决/已应用的条目出账，剩下的留待下次
+
+  if (!quiet) {
+    if (res.applied.length) {
+      console.log(`✏️ 检测到 ${res.applied.length} 个冲突 diff 被人工修改过：已复检并写回两侧`);
+      for (const a of res.applied) {
+        console.log(`   ✔ ${a.name} → 扁平仓库 + ${a.content ? 'content/' : '（content/ 无此页）'} 已一致`
+          + (a.done ? `（diff 归档为 ${path.basename(a.done)}）` : ''));
+      }
+    }
+    if (res.resolved.length) console.log(`✅ ${res.resolved.length} 个冲突已无差异（两侧一致）：${res.resolved.join('、')}`);
+    if (res.failed.length) {
+      console.log('⚠️ 以下人工结果未被采用（原文件保持不动）：');
+      for (const f of res.failed) console.log(`   ✗ ${f.name}：${f.why}`);
+      console.log(`   修正后可重跑本命令；或换用：node content-sync.js resolve（交互选择一侧）`);
+    }
+    if (res.pending.length) {
+      console.log(`⏳ 仍有 ${res.pending.length} 个冲突未解决（diff 未改动）：${res.pending.join('、')}`);
+      console.log(`   改 diff 后重跑本命令即自动合并：${path.join(dir, '<页>.diff')}`);
+    }
+  }
+  return res;
 }
 
 // ---------------------------------------------------------------------------
@@ -804,7 +985,7 @@ function materializeConflicts(names, flatDir, contentDir, opts = {}) {
 function cli() {
   const argv = process.argv.slice(2);
   // 找出命令（忽略 --opt 及其取值），兼容选项在命令前/后
-  const known = ['mirror', 'flatten', 'status', 'check', 'dedupe-images', 'conflicts', 'resolve', 'diff'];
+  const known = ['mirror', 'flatten', 'status', 'check', 'dedupe-images', 'conflicts', 'resolve', 'apply', 'diff'];
   let cmd = argv.find((a) => known.includes(a));
   cmd = cmd || argv[0];
   const optOf = (k) => {
@@ -816,6 +997,12 @@ function cli() {
   const flatDir = optOf('flat') || cfg.wikiRepo;
   const contentDir = optOf('content') || cfg.contentDir;
   const repo = flatDir;
+
+  // 会写文件的命令：先复检「上次生成的冲突 diff 是否被人工改过」
+  // 改过 → 当成本页最终正文写回两侧（不产生新冲突才写），然后继续原命令
+  if (['mirror', 'flatten', 'resolve'].includes(cmd) && !dry) {
+    autoApplyEditedDiffs(flatDir, contentDir, repo);
+  }
 
   if (cmd === 'mirror') {
     // 先预检：mirror 以扁平仓库为准，会回退 content/ 侧的本地改动
@@ -922,8 +1109,18 @@ function cli() {
     }
   } else if (cmd === 'resolve') {
     resolveConflictsInteractive(flatDir, contentDir, repo);
+  } else if (cmd === 'apply') {
+    // 只做复检与写回，不跑同步：适合「我改完 diff 了，先看看能不能合并」
+    const r = autoApplyEditedDiffs(flatDir, contentDir, repo);
+    const left = r.pending.concat(r.failed.map((f) => f.name));
+    if (!left.length) console.log('✅ 冲突均已解决：可继续 flatten / publish。');
+    else {
+      console.log(`⚠️ 仍有 ${left.length} 个冲突未解决：${left.join('、')}`);
+      console.log('   改对应 .diff（写成本页最终正文）后重跑本命令，或 node content-sync.js resolve。');
+      process.exit(1);
+    }
   } else {
-    console.log(`用法: node content-sync.js mirror|flatten|status|diff|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR] [--dry-run] [--force]`);
+    console.log(`用法: node content-sync.js mirror|flatten|status|diff|check|conflicts|resolve|apply|dedupe-images [--flat DIR] [--content DIR] [--dry-run] [--force]`);
   }
 }
 
@@ -938,4 +1135,5 @@ module.exports = {
   safeConflictName, defaultConflictDir, writeConflictDiffs, resolveConflictsInteractive,
   contentLayoutConflicts, layoutHints,
   analyzeMirror, analyzeFlatten, localEdited, OVERWRITE_LABEL, materializeConflicts,
+  writeIfChanged, autoApplyEditedDiffs, conflictInventory, readConflictState, writeConflictState,
 };

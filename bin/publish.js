@@ -487,7 +487,11 @@ async function main() {
     console.log('');
     console.log('===== 回写内容树 content/ → 扁平仓库 =====');
 
-    // 0a. 删除预检：页面「content/ 没有、扁平仓库仍跟踪」＝待删除，先列清单并等确认；
+    // 0a. 若上次生成的冲突 diff 被人工改过（任何外部差异编辑器改完保存）→
+    //     复检后写回两侧（会产生新冲突则回滚），然后继续发布，无需 --force。
+    contentSync.autoApplyEditedDiffs(REPO_DIR, CONTENT_DIR, REPO_DIR);
+
+    // 0b. 删除预检：页面「content/ 没有、扁平仓库仍跟踪」＝待删除，先列清单并等确认；
     //     对 git-mediawiki 删不掉的（非 wikitext 内容模型）改为清空 + 同格式注释占位。
     const pending = contentSync.analyzePublish(REPO_DIR, CONTENT_DIR, REPO_DIR);
     if (!pending.conflict.length && pending.deletion.length) {
@@ -501,7 +505,8 @@ async function main() {
       console.log('   原因: 这些页面在 content/ 与扁平仓库被各自修改，需先人工合并后再发布');
       if (pub.conflictDiffs && pub.conflictDiffs.length) {
         console.log(`   ⚠️ 已生成冲突 diff：${pub.conflictDir}`);
-        console.log('   在 VS Code 差异编辑器打开（每行一条，两窗格改成一致后重跑 publish）：');
+        console.log('   用任何差异编辑器改对应 <页>.diff（写成本页最终正文）后重跑 publish，会自动复检并写回；');
+        console.log('   或直接在下面两份文件里改成一致（每行一条）：');
         for (const f of pub.conflictDiffs) {
           console.log('     code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"');
         }

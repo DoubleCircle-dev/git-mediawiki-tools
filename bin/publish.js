@@ -506,13 +506,11 @@ async function main() {
       for (const n of pub.conflict) console.log('   ! ' + n);
       console.log('   原因: 这些页面在 content/ 与扁平仓库被各自修改，需先人工合并后再发布');
       if (pub.conflictDiffs && pub.conflictDiffs.length) {
-        console.log(`   ⚠️ 已生成冲突 diff：${pub.conflictDir}`);
-        console.log('   用任何文本编辑器（记事本 / nano / vim 都行）改对应 <页>.diff：');
-        console.log('   整份替换成该页最终正文（别留 -、+、@@ 这些行），保存后重跑 publish 会自动复检并写回；');
-        console.log('   或直接把下面两份文件改成一致（想左右对照可用 code --diff / 任何差异工具）：');
+        console.log(`   ⚠️ 冲突已写进 git（扁平仓库 index，UU）——直接在 VS Code 里解决：`);
+        console.log('     源代码管理 →「合并更改」→ 点文件上的「在合并编辑器中解决」→ 选 Accept Current/Incoming →「完成合并」');
+        console.log('     然后重跑 publish：会自动写回 content/ 并清掉冲突条目（放弃：content-sync.js git-merge --abort）');
         for (const f of pub.conflictDiffs) {
-          console.log('     扁平 ' + f.flat);
-          console.log('     内容 ' + (f.content || '（content/ 无此页）'));
+          if (f.diff) console.log('     文本兜底 diff：' + f.diff);
         }
       } else {
         console.log('   处理: 在 content/ 对应文件与扁平仓库间取一致后，重新运行 node publish.js');

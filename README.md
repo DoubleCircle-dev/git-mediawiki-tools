@@ -90,8 +90,8 @@ node bin/sync.js
 | `node bin/content-sync.js check` | 往返一致性自检 |
 | `node bin/content-sync.js conflicts` | 列出冲突并生成 `<内容树同级>/.content-sync/conflicts/*.diff` + `index.md` |
 | `node bin/content-sync.js resolve` | 逐个解决冲突：停在命令行，**两侧改到一致会自动进入下一项**（也可 f/c/s/q） |
-| `node bin/content-sync.js apply` | 只做「改过 diff → 复检写回两侧」，不跑同步（有遗留冲突时退出码 1） |
-| `node bin/content-sync.js git-merge` | 把冲突写成**真实 git 冲突**（`UU`）供 VS Code 源代码管理面板 → 合并编辑器处理；`--abort` 撤销 |
+| `node bin/content-sync.js apply` | 只做复检写回（git 冲突 / 改过的 diff 都认），不跑同步（有遗留冲突时退出码 1） |
+| `node bin/content-sync.js git-merge` | 把冲突写成**真实 git 冲突**（`UU`）供 VS Code 源代码管理面板 → 合并编辑器处理（检测到冲突时已自动做过）；`--abort` 撤销 |
 | `npm run open-conflicts` | 逐个打开冲突（默认 `code --merge`，`--mode diff` 改差异编辑器）；回车开下一个 |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
 | `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史 |
@@ -108,90 +108,61 @@ node bin/sync.js
 因此两者都可能覆盖对侧同名文件的改动（含未提交改动）。CLI 会在覆盖前列出清单并要求
 `--force`（不加则中止），同一份状态里连着跑两个方向也看不出干净结果。
 
-要合并两侧改动，**不需要装任何插件**。工具在检测到冲突时会自动把统一差异写到
-`<内容树同级>/.content-sync/conflicts/`：`<页>.diff`（差异正文）、`index.md`（总览，含每个页面的
-真实路径与精确命令）、`state.json`（回执：记录每个 diff 的指纹，用于下次复检「是否被人工改过」）。
-下面四种方式任选，**都以「工具复检后写回两侧」收尾**。
+要合并两侧改动，**不需要装任何插件**：工具检测到冲突时会直接把冲突**写进 git**
+（扁平仓库 index 标为 `UU`，工作树写入 `<<<<<<<` 标记），你在 VS Code 里用自带的 Git 面板
++ 合并编辑器解决即可。
 
-### 方式四：任何文本编辑器（记事本 / nano / vim ……，不用 VS Code）
+### 冲突流程（默认）
 
-1. 打开该页对应的 `<页>.diff`（路径见 CLI 输出的「改这里」，或 `index.md` 每节的 `diff :` 行）；
-2. 把内容**整份替换**成该页的**最终正文**——不要保留 `diff --git` / `---` / `+++` / `@@` 行，
-   也不要把 `-`、`+` 前缀留在正文里；
-3. 保存，然后**重跑刚才那条命令**（`flatten` / `mirror` / `publish` / `apply`）。
+任何命令检测到冲突（`status` / `conflicts` / `diff` / `resolve` / `mirror` 拦截时 / `flatten` 拦截时 /
+`publish` 中止时）都会：
 
-### 方式一：写进 git，用 VS Code 源代码管理面板 / 合并编辑器处理（推荐）
+1. 在扁平仓库 index 里写入三个 stage —— `1` = `HEAD`（共同祖先）、`2` = 扁平工作树（**线上**，
+   合并编辑器里的 **Current**）、`3` = `content/`（**本地**，**Incoming**），工作树文件写成带
+   `<<<<<<<` 标记的版本；于是 `git status` 显示 `UU`，VS Code 源代码管理面板把它列进**「合并更改」**；
+2. 顺便在 `<内容树同级>/.content-sync/conflicts/` 留一份**文本兜底**（`<页>.diff` + `index.md`），
+   供无 git / 非文本页使用。
 
-```bash
-node bin/content-sync.js git-merge        # 把当前冲突写成真实 git 冲突（UU）
-```
+然后：
 
-它会在扁平仓库 index 里写入三个 stage（`HEAD` = 共同祖先、扁平工作树 = 线上（Current）、
-`content/` = 本地（Incoming）），并把工作树文件写成带 `<<<<<<<` 标记的版本。
-于是 `git status` 显示 `UU`（both modified），VS Code 源代码管理面板会把它列进**「合并更改」**：
-
-- 点文件上的 **「在合并编辑器中解决」**（或设 `\"git.mergeEditor\": true` 后双击文件直接进 3 方合并编辑器）；
-- 合并器里 **Current = 扁平仓库 / 线上**，**Incoming = content/ 本地编辑**，点**「完成合并」**；
-- 回来重跑 `flatten` / `publish`：工具会把结果同步回 `content/` 并自动清除冲突条目（相当于 `git add`）。
-
-放弃这次合并：`node bin/content-sync.js git-merge --abort`（还原扁平侧工作树 + 清 index）。
-
-> 二进制图片、以及「只有一侧有文件」的删除/新增类冲突无法用三方合并，会被自动跳过，
-> 仍走下面的 diff 方式。
-
-### 方式二：VS Code 三方合并编辑器，结果直接写进 `.diff`（不入 git）
+1. VS Code **源代码管理** → 「**合并更改**」→ 点文件上的「**在合并编辑器中解决**」
+   （或设 `"git.mergeEditor": true` 后双击文件直接进 3 方合并编辑器）
+2. 合并器里 **Current = 扁平仓库 / 线上**，**Incoming = content/ 本地** → 选 Accept Current / Incoming
+   → 点**「完成合并」**
+3. 回来**重跑刚才那条命令**（`flatten` / `publish`，或只复检的 `apply`）：工具会把结果同步回
+   `content/`、并清掉 index 里的冲突条目（相当于 `git add`）
 
 ```bash
-code --diff "<扁平文件>" "<内容文件>"      # 两个路径 index.md / CLI 里都给了
+node bin/content-sync.js git-merge        # 也可以手动执行：把当前冲突写进 git
+node bin/content-sync.js git-merge --abort # 放弃这次合并：还原扁平侧工作树 + 清 index
+node bin/content-sync.js apply            # 只复检写回，不跑同步（有遗留冲突时退出码 1）
 ```
 
-界面做法：资源管理器里右键第一个文件 → **「选择以进行比较」**，再右键第二个 → **「与已选项目进行比较」**。
-右侧窗格（content）可直接编辑；合并好后把内容同步到另一侧（`Ctrl+A` `Ctrl+C` → 打开另一侧 `Ctrl+A` `Ctrl+V` 保存）。
-**两侧一致后重跑命令即自动放行**（复检「已无差异」，不必改 diff）。
+> - 只关标签页、不点「完成合并」＝仍未解决；重跑命令只会提示还剩哪些。
+> - **没有解决之前不会提交**：`publish` 会中止（`git` 本身也拒绝提交 unmerged 的路径），
+>   不会把 `<<<<<<<` 标记推到线上。
+> - `--force` 是「以某一侧为准」的语义：`mirror --force` 按扁平/线上采用、`flatten --force` 按
+>   `content/` 采用，并顺手清掉这些 git 冲突条目。
 
-### 方式三：VS Code 差异编辑器（两窗格对照，就地合并）
+### 兜底：非文本页 / 无 git 环境
+
+二进制图片、以及「只有一侧有文件」的删除/新增类冲突无法三方合并，会被自动跳过（提示里会列出来）：
+
+- 用 `node bin/content-sync.js resolve` 逐项输 `f`（扁平→内容）/ `c`（内容→扁平）；
+- 或用**任何文本编辑器**打开 `.content-sync/conflicts/<页>.diff`，整份替换成该页**最终正文**
+  （别留 `-`、`+`、`@@` 这些 diff 符号），保存后重跑命令 —— 工具复检（不会产生新冲突才写）
+  后写回两侧，并把 `.diff` 归档为 `<页>.diff.done`。
+
+想在 VS Code 里逐个无障碍处理（弹一个、解决一个回车下一个）：
 
 ```bash
-D=.content-sync/conflicts/<页>.diff
-git -C "<扁平仓库>" show HEAD:'<页>' > /tmp/base.txt    # 共同祖先；HEAD 里没有该页就用空文件
-rm -f "$D"                                              # 让编辑器从零生成结果
-code --merge "<扁平文件>" "<内容文件>" /tmp/base.txt "$D"
+npm run open-conflicts                  # 逐个打开三方合并编辑器（code --merge，结果写进 .diff）
+npm run open-conflicts -- --mode diff    # 改为逐个打开差异编辑器（code --diff）
 ```
 
-`code --merge <path1> <path2> <base> <result>`：两个修改版本、共同祖先、输出文件。
-在合并编辑器里选 Accept Current / Incoming（或直接编辑结果窗格）→ 点**「完成合并」**才算写出。
-
-> ⚠️ 只关标签页不点「完成合并」＝没有结果；此时重跑命令只会提示「diff 未改动，冲突仍在」。
-
-### 逐个打开 + 在 VS Code 内部一键跑
-
-```bash
-npm run open-conflicts                  # 默认：逐个打开三方合并编辑器（方式三）
-npm run open-conflicts -- --mode diff    # 改为逐个打开差异编辑器（方式二）
-```
-
-一次只打开一个冲突：处理完（合并 / 改好并保存）回到终端按回车，打开下一个；也可以输 `s` 跳过、
-`q` 退出。脚本会把共同祖先与 `.diff` 落点都准备好，所以方式三**不需要**你手工拼路径。
-
-VS Code 内部（不敲命令）：`Ctrl+Shift+P` → **Tasks: Run Task**（中文界面：**任务: 运行任务**）→
-选「冲突：逐个打开（三方合并编辑器）」等任务；任务定义在 `.vscode/tasks.json`，也可直接
-`Ctrl+Shift+B`（默认绑定「运行生成任务」）或从终端菜单 **终端 → 运行任务** 进入。
-
-### 收尾：复检与写回
-
-无论用哪种方式，最后**重跑一次命令**即可：
-
-```bash
-node bin/content-sync.js apply        # 只复检写回，不跑同步（有遗留冲突时退出码 1）
-node bin/content-sync.js flatten      # 或直接跑同步：复检通过就继续执行
-```
-
-工具会：校验人工结果（非空 / 无冲突标记 / 不是 diff 结构）→ 写回**两侧**（扁平仓库 + content/）→
-确认**不产生原来冲突之外的新冲突**，否则**回滚**、原文件一字不动；已解决的 diff 归档为
-`<页>.diff.done`。想先单独看看能不能合并，跑 `apply` 即可。
-
-**只要检测到冲突，diff 就会自动落盘**：`status` / `conflicts` / `diff` / `resolve` / `mirror`（拦截时）、
-`flatten`（拦截时）、`publish`（中止时）都会写出上述产物。
+VS Code 内部（不敲命令）：`Ctrl+Shift+P` → **任务: 运行任务**（Tasks: Run Task），可选
+「冲突：写进 git」「冲突：复检并写回两侧」「冲突：逐个打开…」「同步：flatten」「状态：查看两侧差异」；
+任务定义在 `.vscode/tasks.json`，也可从终端菜单 **终端 → 运行任务** 进入。
 
 - `content/pages/`：主命名空间页面（无前缀）。
 - `content/<命名空间>/`：各命名空间目录；标题里的 `/` 用真实子目录表示。

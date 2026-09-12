@@ -29,6 +29,12 @@
   "scripts": {
     "sync": "node bin/sync.js",
     "publish": "node bin/publish.js",
-    "status": "node bin/content-sync.js status"
+    "set-pass": "node bin/set-pass.js",
+    "status": "node bin/content-sync.js status",
+    "content-sync": "node bin/content-sync.js",
+    "preview:start": "node bin/preview.js start",
+    "preview:watch": "node bin/preview.js watch",
+    "preview:stop": "node bin/preview.js stop",
+    "preview:squash": "node bin/preview.js squash"
   }
 }

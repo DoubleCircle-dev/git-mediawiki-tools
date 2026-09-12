@@ -17,13 +17,21 @@
  * 安全原则：绝不静默覆盖“两侧同时改动”的内容；检测到冲突会返回给调用方决定。
  *
  * 命令行用法：
- *   node bin/content-sync.js mirror|flatten|status|check|dedupe-images [--flat DIR] [--content DIR]
+ *   node bin/content-sync.js mirror|flatten|status|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR]
+ *
+ *   conflicts 命令在检测到“两侧各自改同一页”的冲突时，为每个冲突页生成统一差异
+ *   （unified diff）到 <内容树同级>/.content-sync/conflicts/，便于在 VS Code
+ *   差异编辑器（code --diff 扁平文件 内容文件）中查看并人工合并。
+ *   resolve 命令逐个用 code --diff 打开冲突并停在命令行等你编辑：两侧改到一致
+ *   即自动推进，也可输入 f/c 直接由命令行采用一侧——可视化编辑与命令行修改同步进行。
+ *   diff 命令列出“本地待同步差异”（内容树待回写 + 扁平新改动）并给出每文件
+ *   code --diff 查看命令，供同步/发布前在差异编辑器里核对。
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
 const MW_EXT = '.mw';
 const MAIN_NS = '(Main)';
@@ -188,6 +196,66 @@ function flatName(rel) {
 }
 
 // ---------------------------------------------------------------------------
+// content 树布局 / index 冲突检测
+// ---------------------------------------------------------------------------
+// 规范（与 mirrorRel 一致）：既是页面又有子页面的父页面必须存为 <目录>/index.mw。
+// 若 <...>/X.mw 与 <...>/X/index.mw 并存，会映射到同一扁平页面 X —— 此前会被
+// contentNameMap 的 set() 静默覆盖、造成“改了不生效 / 读到旧版”的隐患，故集中检测：
+//   dup      [{flat, rels}] 同一扁平名被多个 content 页占用（真实 index 冲突）
+//   nonIndex [rel]          父页面以顶层 <...>/X.mw 存放（缺 X/index.mw）
+//   loneIndex [rel]         X/index.mw 但目录下无子页（应改回普通 <...>/X.mw）
+function contentLayoutConflicts(contentDir) {
+  const { map } = scanContent(contentDir);
+  const rels = [...map.keys()].filter((r) => r.endsWith(MW_EXT));
+  const flatOf = (r) => { try { return flatName(r); } catch (e) { return null; } };
+  const byFlat = new Map();
+  for (const rel of rels) {
+    const f = flatOf(rel);
+    if (f === null) continue;
+    if (!byFlat.has(f)) byFlat.set(f, []);
+    byFlat.get(f).push(rel);
+  }
+  const dup = [];
+  for (const [flat, list] of byFlat) if (list.length > 1) dup.push({ flat, rels: list });
+
+  // 与扁平仓库往返一致的位置才算规范：mirrorRel(flatName(rel)) === rel
+  const flatAll = rels.map(flatOf).filter((f) => f !== null);
+  const dupFlats = new Set(dup.map((d) => d.flat));
+  const isCanonical = (rel) => {
+    const f = flatOf(rel);
+    if (f === null) return false;
+    try { return mirrorRel(f, flatAll) === rel; } catch (e) { return false; }
+  };
+  const nonIndex = [], loneIndex = [];
+  for (const rel of rels) {
+    if (isCanonical(rel)) continue;
+    if (dupFlats.has(flatOf(rel))) continue; // 已由 dup 覆盖（删多余副本即可）
+    if (rel.endsWith('/index.mw')) loneIndex.push(rel);
+    else nonIndex.push(rel);
+  }
+  return { dup, nonIndex, loneIndex, byFlat };
+}
+
+// 每条布局问题的建议处置（供 CLI / 发布中止提示复用）
+function layoutHints(layout) {
+  const hints = [];
+  for (const d of layout.dup) {
+    const keep = d.rels.find((r) => r.endsWith('/index.mw')) || d.rels[0];
+    for (const r of d.rels) {
+      if (r === keep) continue;
+      hints.push(`index冲突 ${d.flat}：content/${r} 与 content/${keep} 并存，请删除多余文件 content/${r}`);
+    }
+  }
+  for (const r of layout.nonIndex) {
+    hints.push(`父页面应存为 index.mw：content/${r} → content/${r.slice(0, -MW_EXT.length)}/index.mw`);
+  }
+  for (const r of layout.loneIndex) {
+    hints.push(`无子页的 index.mw 应改回普通页：content/${r} → content/${r.replace(/\/index\.mw$/, MW_EXT)}`);
+  }
+  return hints;
+}
+
+// ---------------------------------------------------------------------------
 // git 辅助
 // ---------------------------------------------------------------------------
 function gitRun(repo, args) {
@@ -251,19 +319,12 @@ function mirrorToContent(flatDir, contentDir, opts = {}) {
 }
 
 // 内容树 -> 扁平（写根目录；不删除；skip 参数可跳过某些扁平文件名）
+// 重复扁平名只回写规范 index.mw，多余顶层文件不写入；处置见 dup/hints。
 function flattenToFlat(flatDir, contentDir, opts = {}) {
-  const { map } = scanContent(contentDir);
+  const { byFlat, layout } = contentNameMap(contentDir);
   const skip = opts.skip || new Set();
-  const targets = new Map(); // flat -> rel
-  const dup = [];
-  for (const rel of [...map.keys()]) {
-    let flat;
-    try { flat = flatName(rel); } catch (e) { continue; }
-    if (targets.has(flat)) { dup.push([flat, rel]); continue; }
-    targets.set(flat, rel);
-  }
   let written = 0, unchanged = 0;
-  for (const [flat, rel] of [...targets].sort()) {
+  for (const [flat, rel] of [...byFlat.entries()].sort()) {
     if (skip.has(flat)) continue;
     const src = path.join(contentDir, rel);
     const dst = path.join(flatDir, flat);
@@ -271,18 +332,26 @@ function flattenToFlat(flatDir, contentDir, opts = {}) {
     written++;
     if (!opts.dryRun) copyIfChanged(src, dst);
   }
-  return { written, unchanged, skipped: skip.size, dup };
+  return { written, unchanged, skipped: skip.size, dup: layout.dup, hints: layoutHints(layout) };
 }
 
 // 内容树相对路径 -> 对应扁平文件名的存在映射（用于内容侧遍历）
+// 重复扁平名（如 <...>/X.mw 与 <...>/X/index.mw 并存）只取规范 index.mw，
+// 其余顶层副本不再参与映射，由 contentLayoutConflicts/layoutHints 报告处置。
 function contentNameMap(contentDir) {
   const { map, unmanaged } = scanContent(contentDir);
+  const layout = contentLayoutConflicts(contentDir);
   const out = new Map(); // flat name -> rel
   const bad = [];
-  for (const rel of map.keys()) {
-    try { out.set(flatName(rel), rel); } catch (e) { bad.push(rel); }
+  for (const rel of [...map.keys()].sort()) {
+    let flat;
+    try { flat = flatName(rel); } catch (e) { bad.push(rel); continue; }
+    const prev = out.get(flat);
+    if (prev === undefined) { out.set(flat, rel); continue; }
+    // 多个 content 页映射到同一扁平名：优先保留 index.mw（父页面规范存放）
+    if (rel.endsWith('/index.mw') && !prev.endsWith('/index.mw')) out.set(flat, rel);
   }
-  return { byFlat: out, unmanaged, bad };
+  return { byFlat: out, layout, unmanaged, bad };
 }
 
 // 扁平侧 + 内容侧 的当前字节 sha1（懒加载缓存）
@@ -376,11 +445,103 @@ function analyzePublish(flatDir, contentDir, repo) {
 }
 
 // ---------------------------------------------------------------------------
+// 冲突 diff 生成：检测到冲突时为每个冲突页产出 unified diff 文件，
+// 便于在 VS Code 差异编辑器（code --diff 扁平文件 内容文件）中查看并人工合并。
+// 产物目录：<内容树同级>/.content-sync/conflicts（不在 content/ 也不在扁平仓库内，
+// 不会混入页面同步）。
+// ---------------------------------------------------------------------------
+const CONFLICT_SUBDIR = path.join('.content-sync', 'conflicts');
+
+// 冲突扁平文件名 -> 文件系统安全名（: / \ 会跨目录或引起混淆，替换为 _）
+function safeConflictName(name) {
+  return name.replace(/[:\\/]/g, '_');
+}
+
+// 默认冲突产物目录：内容树上一级目录下的 .content-sync/conflicts
+function defaultConflictDir(contentDir) {
+  return path.join(path.resolve(contentDir, '..'), CONFLICT_SUBDIR);
+}
+
+// 为一批冲突扁平名生成 diff 产物：
+//   <安全名>.diff   unified diff（a=扁平仓库/线上，b=content/ 本地编辑）；二进制图不生成
+//   index.md        总览：真实路径与可直接运行的 code --diff 打开命令
+// 返回 { dir, files: [{ name, diff, flat, content }] }
+function writeConflictDiffs(conflictNames, flatDir, contentDir, outDir) {
+  const dir = outDir || defaultConflictDir(contentDir);
+  fs.mkdirSync(dir, { recursive: true });
+  const byFlat = contentNameMap(contentDir).byFlat;
+  const files = [];
+  for (const name of conflictNames) {
+    const flatP = path.join(flatDir, name);
+    const rel = byFlat.get(name);
+    const contentP = rel ? path.join(contentDir, rel) : null;
+    const flatExists = fs.existsSync(flatP);
+    const contentExists = !!contentP && fs.existsSync(contentP);
+    // 二进制图冲突：文本 diff 无意义，只登记到 index.md，提示直接以一侧覆盖
+    if (!isImage(name) && (flatExists || contentExists)) {
+      const a = flatExists ? flatP : '/dev/null';
+      const b = contentExists ? contentP : '/dev/null';
+      const r = spawnSync('git', ['diff', '--no-index', '--', a, b], { encoding: 'utf8' });
+      const diffText = ((r.stdout || '') + (r.stderr || '')).trim();
+      if (diffText) {
+        const diffP = path.join(dir, safeConflictName(name) + '.diff');
+        fs.writeFileSync(diffP, diffText + '\n');
+        files.push({ name, diff: diffP, flat: flatP, content: contentP });
+      }
+    } else {
+      files.push({ name, diff: null, flat: flatP, content: contentP }); // 二进制：仅登记
+    }
+  }
+  // 总览 index.md
+  const lines = [
+    '# 内容同步冲突（' + new Date().toISOString() + '）',
+    '',
+    '以下页面在 content/（本地编辑工作区）与扁平仓库（线上来源）被**各自修改**，无法自动合并。',
+    '每个 `*.diff` 均为 unified diff：`a/` = 扁平仓库版本，`b/` = content/ 版本。',
+    '',
+    '解决方式（任选其一，使两侧一致后重跑 content-sync / publish）：',
+    '- 保留 **content/**（本地意图）：把扁平仓库文件改成与 content/ 一致；',
+    '- 保留**扁平仓库**（线上最新）：把 content/ 文件改成与扁平仓库一致；',
+    '- 或：`code --diff "<扁平文件>" "<内容文件>"` 打开 VS Code 差异编辑器手动合并。',
+    '',
+  ];
+  for (const f of files) {
+    lines.push('## ' + f.name);
+    lines.push('- diff : ' + (f.diff ? '`' + f.diff + '`' : '（二进制，无法生成文本 diff，请直接以一侧覆盖）'));
+    lines.push('- 扁平 : `' + f.flat + '`');
+    lines.push('- 内容 : `' + (f.content || '（content/ 无此页，属删除类冲突）') + '`');
+    lines.push('- 打开 : `code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"`');
+    lines.push('');
+  }
+  fs.writeFileSync(path.join(dir, 'index.md'), lines.join('\n'));
+  return { dir, files };
+}
+
+// ---------------------------------------------------------------------------
 // 发布：执行内容树 -> 扁平（含删除）；有冲突返回 false
 // ---------------------------------------------------------------------------
 function applyPublish(flatDir, contentDir, repo, opts = {}) {
+  const layout = contentLayoutConflicts(contentDir);
+  if (layout.dup.length) {
+    // index 冲突会令回写读到“错误那份”文件，属内容树自身缺陷：直接中止，让用户先清理
+    return {
+      ok: false, conflict: [], conflictDir: null, conflictDiffs: [],
+      indexConflicts: layout.dup, indexConflictHints: layoutHints(layout),
+    };
+  }
   const a = analyzePublish(flatDir, contentDir, repo);
-  if (a.conflict.length) return { ok: false, conflict: a.conflict };
+  if (a.conflict.length) {
+    // 冲突时默认自动生成 diff 供差异编辑器查看/合并（可用 opts.writeConflicts=false 关闭）
+    let artifacts = null;
+    if (opts.writeConflicts !== false) {
+      artifacts = writeConflictDiffs(a.conflict, flatDir, contentDir, opts.conflictDir);
+    }
+    return {
+      ok: false, conflict: a.conflict,
+      conflictDir: artifacts && artifacts.dir,
+      conflictDiffs: artifacts && artifacts.files,
+    };
+  }
   let written = 0, deleted = 0;
   if (!opts.dryRun) {
     for (const name of a.flatten) {
@@ -440,12 +601,108 @@ function pendingLocalEdits(flatDir, contentDir) {
 }
 
 // ---------------------------------------------------------------------------
+// resolve：交互式可视化解决冲突（可视化编辑 + 命令行同步推进）
+// 逐个冲突自动用 `code --diff 扁平 内容` 打开 VS Code 差异编辑器，脚本停在命令行
+// 等你：把两侧改成一致（保存即可）后回车即自动进入下一项；也可直接输入 f/c 由
+// 命令行采用一侧，或 s 跳过 / q 退出。
+// ---------------------------------------------------------------------------
+function openVsCodeDiff(flatP, contentP) {
+  try {
+    const p = spawn('code', ['--diff', flatP, contentP || '/dev/null'],
+      { detached: true, stdio: 'ignore' });
+    p.on('error', () => console.log('   （未找到 code 命令，请手动执行上方 code --diff 命令打开差异编辑器）'));
+    p.unref();
+  } catch (e) { /* ignore */ }
+}
+
+function resolveConflictsInteractive(flatDir, contentDir, repo) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const ask = (q) => new Promise((res) => rl.question(q, res));
+
+  (async () => {
+    const byFlat = contentNameMap(contentDir).byFlat;
+    let a = analyzePublish(flatDir, contentDir, repo);
+    let todo = [...a.conflict];
+    if (!todo.length) {
+      console.log('✅ 无冲突：内容树与扁平仓库没有“两侧各自改同一页”，可直接 publish。');
+      rl.close(); return;
+    }
+    console.log(`发现 ${todo.length} 个冲突，逐个在 VS Code 差异编辑器解决（命令行同步推进）：`);
+    console.log('提示：在差异编辑器把两侧改成一致并保存后回车；或直接输入 f/c 由命令行采用一侧。');
+    let i = 0;
+    const consistentOf = (flatP, contentP) => {
+      if (!fs.existsSync(flatP)) return false;
+      if (!contentP || !fs.existsSync(contentP)) return false; // 删除类：需人工
+      return sha1File(flatP) === sha1File(contentP);
+    };
+    while (i < todo.length) {
+      const name = todo[i];
+      const flatP = path.join(flatDir, name);
+      const rel = byFlat.get(name);
+      const contentP = rel ? path.join(contentDir, rel) : null;
+      const cExists = !!contentP && fs.existsSync(contentP);
+      console.log('\n[' + (i + 1) + '/' + todo.length + '] ' + name);
+      console.log('  扁平 : ' + flatP);
+      console.log('  内容 : ' + (contentP || '（无：content/ 已删此页，删除类冲突）'));
+      console.log('  打开 : code --diff "' + flatP + '" "' + (contentP || '/dev/null') + '"');
+      if (fs.existsSync(flatP) || cExists) openVsCodeDiff(flatP, contentP);
+      for (;;) {
+        const ok = consistentOf(flatP, contentP);
+        const ans = (await ask(ok
+          ? '  ✓ 两侧已一致，回车进入下一项 > '
+          : '  [回车]检查是否已改一致  f=采用扁平→内容  c=采用内容→扁平  s=跳过  q=退出 > ')).trim().toLowerCase();
+        if (!ans || ans === 'ok' || ans === 'y') {
+          if (ok) { i++; break; }
+          console.log('  ⚠️ 两侧还不一致：在差异编辑器改到一致并保存后回车；或输入 f/c 直接采用一侧。');
+          continue;
+        }
+        if (ans === 'f') {
+          if (fs.existsSync(flatP) && contentP && fs.existsSync(contentP)) {
+            copyIfChanged(flatP, contentP);
+            console.log('  ✔ 已采用扁平侧 → content/（' + (rel || '') + '）');
+          } else if (fs.existsSync(flatP) && !cExists) {
+            const rel2 = mirrorRel(name, listFlat(flatDir).mw);
+            copyIfChanged(flatP, path.join(contentDir, rel2));
+            console.log('  ✔ 已在 content/ 恢复（复活）该页：' + rel2);
+          } else {
+            console.log('  ⚠️ 扁平侧不存在，无法采用。');
+          }
+          continue;
+        }
+        if (ans === 'c') {
+          if (cExists) {
+            copyIfChanged(contentP, flatP);
+            console.log('  ✔ 已采用 content/ → 扁平仓库');
+          } else {
+            console.log('  ⚠️ content/ 无此页，无法“采用内容”。如需删除请手动处理（或跳过 s）。');
+          }
+          continue;
+        }
+        if (ans === 's') { console.log('  已跳过（保留冲突）。'); i++; break; }
+        if (ans === 'q') { console.log('  退出。'); rl.close(); return; }
+        console.log('  未知输入（回车 / f / c / s / q）。');
+      }
+    }
+    a = analyzePublish(flatDir, contentDir, repo);
+    console.log('');
+    if (a.conflict.length) {
+      console.log(`⚠️ 仍剩 ${a.conflict.length} 个冲突：`, a.conflict);
+      console.log('   可再运行 node git-mediawiki-tools/bin/content-sync.js resolve 继续解决。');
+    } else {
+      console.log('✅ 冲突已全部解决！可直接运行 node publish.js "说明" 发布。');
+    }
+    rl.close();
+  })();
+}
+
+// ---------------------------------------------------------------------------
 // 命令行入口（与 content_manage.py 对齐的轻量实现）
 // ---------------------------------------------------------------------------
 function cli() {
   const argv = process.argv.slice(2);
   // 找出命令（忽略 --opt 及其取值），兼容选项在命令前/后
-  const known = ['mirror', 'flatten', 'status', 'check', 'dedupe-images'];
+  const known = ['mirror', 'flatten', 'status', 'check', 'dedupe-images', 'conflicts', 'resolve', 'diff'];
   let cmd = argv.find((a) => known.includes(a));
   cmd = cmd || argv[0];
   const optOf = (k) => {
@@ -461,11 +718,19 @@ function cli() {
     const s = mirrorToContent(flatDir, contentDir, { dryRun: dry });
     console.log(`mirror: 新建 ${s.created}, 更新 ${s.updated}, 未变 ${s.unchanged}`
       + `, 图片去重 ${s.deduped}${dry ? '（dry-run）' : ''}`);
+    const hints = layoutHints(contentLayoutConflicts(contentDir));
+    if (hints.length) {
+      console.log(`⚠️ content/ 布局/index 冲突 ${hints.length} 处（mirror 不删多余文件，请按提示清理）：`);
+      hints.forEach((h) => console.log('   ' + h));
+    }
   } else if (cmd === 'flatten') {
     const s = flattenToFlat(flatDir, contentDir, { dryRun: dry });
     const d = dry ? 0 : dedupeImages(flatDir, contentDir).linked;
     console.log(`flatten: 写入 ${s.written}, 未变 ${s.unchanged}, 图片去重 ${d}${dry ? '（dry-run）' : ''}`);
-    if (s.dup.length) console.log(`⚠️ 映射冲突 ${s.dup.length} 个（未写入）：`, s.dup.map(([f, r]) => `${r}->${f}`));
+    if (s.hints.length) {
+      console.log(`⚠️ content/ 布局/index 冲突 ${s.dup.length} 处（多余文件未回写）：`);
+      s.hints.forEach((h) => console.log('   ' + h));
+    }
   } else if (cmd === 'dedupe-images') {
     const d = dedupeImages(flatDir, contentDir);
     console.log(`图片去重: 硬链接 ${d.linked} 张，跳过 ${d.skipped} 张`);
@@ -479,6 +744,16 @@ function cli() {
     console.log(`- 待删除(flatten/deletion): ${a.deletion.length}`, a.deletion.slice(0, 15));
     console.log(`- 扁平新改动(发布后刷新内容): ${a.refreshAfter.length}`, a.refreshAfter.slice(0, 15));
     console.log(`- 冲突(需人工): ${a.conflict.length}`, a.conflict.slice(0, 15));
+    const hints = layoutHints(contentLayoutConflicts(contentDir));
+    if (hints.length) {
+      console.log(`⚠️ content/ 布局/index 冲突 ${hints.length} 处：`);
+      hints.forEach((h) => console.log('   ' + h));
+    }
+    if (a.conflict.length) {
+      const c = writeConflictDiffs(a.conflict, flatDir, contentDir);
+      console.log(`  ⚠️ 已为 ${c.files.length} 个冲突生成 diff：${c.dir}`);
+      console.log(`    总览: ${path.join(c.dir, 'index.md')}（可用 code --diff 逐对打开差异编辑器合并）`);
+    }
     if (pend.length) console.log(`⚠️ 内容树有未发布改动: ${pend.length}`, pend.slice(0, 15));
   } else if (cmd === 'check') {
     const { mw, images } = listFlat(flatDir);
@@ -489,9 +764,52 @@ function cli() {
       try { if (flatName(rel) !== f) { console.log('往返不一致', rel, f); err++; } }
       catch (e) { console.log('错误', rel, e.message); err++; }
     }
+    layoutHints(contentLayoutConflicts(contentDir)).forEach((h) => { console.log('内容树布局问题:', h); err++; });
     console.log(`check: ${mw.length} 页 + ${images.length} 图，${err ? '发现问题 ' + err + ' 处 ✗' : '往返一致 ✓'}`);
+  } else if (cmd === 'diff') {
+    const a = analyzePublish(flatDir, contentDir, repo);
+    const byFlat = contentNameMap(contentDir).byFlat;
+    const rows = [];
+    const pushRow = (name, side) => {
+      const fp = path.join(flatDir, name);
+      const rel = byFlat.get(name);
+      rows.push({ name, side, fp, cp: rel ? path.join(contentDir, rel) : null });
+    };
+    (a.flatten || []).forEach((n) => pushRow(n, '内容树→扁平(待回写)'));
+    (a.refreshAfter || []).forEach((n) => pushRow(n, '扁平→内容树(待刷新)'));
+    if (!rows.length) {
+      console.log('无待同步差异：扁平仓库与 content/ 已一致。');
+      if (a.conflict.length) console.log(`（另有 ${a.conflict.length} 个冲突需人工：node content-sync.js resolve）`);
+      return;
+    }
+    console.log(`本地待同步差异 ${rows.length} 个（扁平 ↔ content/，不含冲突）：`);
+    for (const r of rows) {
+      console.log('\n  [' + r.side + '] ' + r.name);
+      console.log('      扁平  : ' + r.fp);
+      console.log('      内容  : ' + (r.cp || '（content/ 无此页）'));
+      console.log('      查看  : code --diff "' + r.fp + '" "' + (r.cp || '/dev/null') + '"');
+    }
+    if (a.conflict.length) {
+      console.log(`\n⚠️ 另有 ${a.conflict.length} 个冲突不属待同步，请先 node content-sync.js resolve 处理：`, a.conflict);
+    }
+  } else if (cmd === 'conflicts') {
+    const a = analyzePublish(flatDir, contentDir, repo);
+    if (!a.conflict.length) {
+      console.log('无冲突：内容树与扁平仓库没有“两侧各自改同一页”的情况。');
+    } else {
+      const c = writeConflictDiffs(a.conflict, flatDir, contentDir);
+      console.log(`共 ${a.conflict.length} 个冲突，已生成 diff 到：${c.dir}`);
+      for (const f of c.files) {
+        console.log('  ' + f.name);
+        console.log('    diff : ' + (f.diff || '（二进制，无文本 diff）'));
+        console.log('    打开 : code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"');
+      }
+      console.log('总览: ' + path.join(c.dir, 'index.md'));
+    }
+  } else if (cmd === 'resolve') {
+    resolveConflictsInteractive(flatDir, contentDir, repo);
   } else {
-    console.log('用法: node content-sync.js mirror|flatten|status|check|dedupe-images [--flat DIR] [--content DIR] [--dry-run]');
+    console.log('用法: node content-sync.js mirror|flatten|status|diff|check|conflicts|resolve|dedupe-images [--flat DIR] [--content DIR] [--dry-run]');
   }
 }
 
@@ -503,4 +821,6 @@ module.exports = {
   gitDirty, gitTracked, sha1Head,
   mirrorToContent, flattenToFlat, contentNameMap, buildState,
   analyzePublish, applyPublish, refreshContentFromFlat, pendingLocalEdits,
+  safeConflictName, defaultConflictDir, writeConflictDiffs, resolveConflictsInteractive,
+  contentLayoutConflicts, layoutHints,
 };

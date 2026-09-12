@@ -2,8 +2,21 @@
 /**
  * 发布脚本：提交本地修改并推送到 git-mediawiki 远程。
  * 推送顺序取 config.json 的 pushOrder（缺省只推主 remote；可在首位放同一 wiki 的快速镜像）。
- * 用法: node publish.js [提交说明]
+ * 每个远程推送前各自做一次 sync（fetch + 采用线上新修订/变基）；推送失败时检查
+ * 该站点是否在推送期间有新修订，如有则提示“该仓库有人上传/站端刚编辑”。
+ *
+ * 远程角色（config.json 的 remotes，缺省全部按 primary）：
+ *   primary 主站      —— 主要推送的站点，必须成功
+ *   accel   加速链接  —— 绑定某个源站（binds）的同一 wiki 端点；推送成功后即视为源站已上线，
+ *                        不再单独推源站（只把修订号同步过去 + 对齐引用）；失败则回退推源站
+ *   mirror  镜像站    —— 独立站点，各自有修订体系；推送后不会立即同步主站，需等其自身同步
+ *
+ * 用法: node publish.js [提交说明] [--yes]
  * 示例: node publish.js "更新首页模板"
+ *   --yes / -y（或 MW_PUBLISH_YES=1）：跳过「待删除页面」的确认。
+ *   删除语义：git-mediawiki 无法真正删网页，只能改写正文（wikitext 页写
+ *   [[Category:Deleted]]；Scribunto/CSS/JS/JSON 页写同格式注释占位）——
+ *   被删页面仍会在线上存在，发布末尾会提醒去线上真正删除。
  */
 'use strict';
 
@@ -20,8 +33,330 @@ const TIMEOUT_MS = cfg.timeoutMs;
 // 内容树同步模块（content/ <-> 扁平仓库）
 const contentSync = require('./content-sync.js');
 
-// 推送顺序：默认只推主 remote；若配置了同一 wiki 的镜像端点（快/慢），按序逐个推
-const PUSH_ORDER = (cfg.pushOrder.length ? cfg.pushOrder : [cfg.remote]);
+// ---------------------------------------------------------------------------
+// 删除语义（git-mediawiki 无法真正删除页面，只能改写正文）
+//   - wikitext 页：helper 会把正文替换为 [[Category:Deleted]]（页面仍在 → 需线上真删）
+//   - 其它内容模型：Scribunto / sanitized-css / css / javascript / json 写 wikitext 会被
+//     各自的内容校验拒绝（helper 还会把该 API 错误误报成 non-fast-forward）
+//     → 改为「清空 + 同格式注释占位」，仍由管理员在线上真正删除
+// ---------------------------------------------------------------------------
+const WIKITEXT_DELETED = '[[Category:Deleted]]';
+const STUB_CONTENT = [
+  { models: ['Scribunto'],
+    text: `-- ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。\n` },
+  { models: ['sanitized-css', 'css', 'less'],
+    text: `/* ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。 */\n` },
+  { models: ['javascript'],
+    text: `// ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。\n` },
+  { models: ['json'],
+    text: `{"_comment": "${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。"}\n` },
+];
+
+// 扁平文件名 -> 页面标题（%2F -> /、_ -> 空格）
+function flatTitle(name) {
+  const stem = name.endsWith('.mw') ? name.slice(0, -3) : name;
+  try { return decodeURIComponent(stem).replace(/_/g, ' '); } catch (e) { return stem.replace(/_/g, ' '); }
+}
+
+// 查询线上页面内容模型（匿名只读 prop=info）；返回 Map(标题 -> 模型/null 表示线上不存在)
+async function fetchContentModels(titles) {
+  const out = new Map();
+  const BASE = cfg.apiUrl || '';
+  if (!BASE || !titles.length) return out;
+  for (let i = 0; i < titles.length; i += 50) {
+    const batch = titles.slice(i, i + 50);
+    try {
+      const res = await fetch(BASE + '?' + new URLSearchParams({
+        format: 'json', action: 'query', prop: 'info', titles: batch.join('|'),
+      }), { headers: { 'User-Agent': 'git-mediawiki-tools/publish' } });
+      const data = await res.json();
+      for (const p of Object.values((data.query && data.query.pages) || {})) {
+        if (!p || !p.title) continue;
+        out.set(p.title.replace(/_/g, ' '), p.missing ? null : (p.contentmodel || undefined));
+      }
+    } catch (e) {
+      console.log(`   ⚠️ 查询内容模型失败（${e.message}），按 wikitext 处理`);
+    }
+  }
+  return out;
+}
+
+function askYesNo(question) {
+  const readline = require('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => { rl.close(); resolve(/^y(es)?$/i.test(String(answer).trim())); });
+  });
+}
+
+// 删除预检：列出待删页面并确认；对 git-mediawiki 删不掉的页面写“同格式占位”到 content/
+// （随本次发布上线）。返回 [{ name, title, model, stub }] 供发布末尾提醒。
+async function prepareDeletions(names, assumeYes) {
+  const plan = names.map((name) => ({ name, title: flatTitle(name), model: undefined, stub: null }));
+  console.log('');
+  console.log(`⚠️ 待删除页面 ${plan.length} 个（content/ 中已不存在，扁平仓库仍跟踪）：`);
+  for (const p of plan) console.log('   - ' + p.title);
+  console.log('   注意：git-mediawiki 只能改写正文，页面本身仍存在，最终需要在线上真正删除。');
+
+  if (!assumeYes) {
+    if (!process.stdin.isTTY) {
+      console.log('非交互终端无法确认：请加 --yes（或设 MW_PUBLISH_YES=1）明确同意后再发布。已中止。');
+      process.exit(1);
+    }
+    const ok = await askYesNo('确认按此处置（删除/清空占位）并随本次发布上线？[y/N] ');
+    if (!ok) {
+      console.log('已取消发布（未改动任何文件）。');
+      console.log('若这些页面只是没同步进 content/，请先执行 node bin/content-sync.js mirror 补回后重试。');
+      process.exit(1);
+    }
+  }
+
+  const models = await fetchContentModels(plan.map((p) => p.title));
+  const allMw = contentSync.listFlat(REPO_DIR).mw;
+  for (const p of plan) {
+    if (contentSync.isImage(p.name)) {
+      p.stub = 'image';
+      console.log(`   ↳ ${p.title}：二进制文件，需由管理员在线上删除（本次仅从本地移除）`);
+      continue;
+    }
+    const model = models.get(p.title);
+    p.model = model === null ? '(线上不存在)' : (model || 'wikitext');
+    if (p.model === '(线上不存在)' || p.model === 'wikitext') continue; // 走 helper 的 [[Category:Deleted]]
+    const stub = (STUB_CONTENT.find((s) => s.models.includes(p.model)) || {}).text;
+    if (!stub) {
+      console.log(`   ↳ ${p.title}：内容模型 ${p.model} 无对应占位格式，按原样提交（可能被服务端拒绝）`);
+      continue;
+    }
+    const rel = contentSync.mirrorRel(p.name, allMw);
+    const dst = path.join(CONTENT_DIR, rel);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.writeFileSync(dst, stub);
+    p.stub = model;
+    console.log(`   ↳ ${p.title}（${model}）：无法由 git-mediawiki 删除 → 已清空为同格式占位（content/${rel}）`);
+  }
+  return plan;
+}
+
+// 发布末尾提醒：以上页面只是被改写正文，仍需在线上真正删除
+function reportDeletions(plan) {
+  if (!plan || !plan.length) return;
+  console.log('');
+  console.log('===== 需在线上真正删除的页面 =====');
+  console.log('以下页面在 content/ 中已删除，本次发布只是改写了线上正文，页面本身仍然存在：');
+  for (const p of plan) {
+    const how = p.stub === 'image' ? '二进制文件，已从本地移除（线上需管理员删除）'
+      : p.stub ? `已清空为 ${p.stub} 同格式占位注释`
+        : `已替换为 ${WIKITEXT_DELETED}`;
+    console.log(`   - ${p.title}（${how}）`);
+  }
+  console.log('请在 wiki 上用 Special:Delete 或 API action=delete 真正删除这些页面，然后本地按需收尾：');
+  console.log('  node bin/content-sync.js mirror   # 把扁平仓库（已无这些页）同步回 content/');
+}
+
+// git-mediawiki 的 helper 失败时 `git fetch` 仍可能返回 0（git 视为“无新引用”），
+// 失败信息只在输出里；若不识别会把失败当成功，用陈旧引用继续。
+const FETCH_FAIL_RE = /Failed to log in|Can't connect|could not read ref|fatal:|error:/i;
+
+// ---------------------------------------------------------------------------
+// 远程角色（config.json 的 remotes；未配置时 pushOrder 里每个远程都按 primary）
+//   primary 主站    ：主要推送的站点，必须成功
+//   accel   加速链接：绑定某个源站（binds）的同一 wiki 端点。推送成功即视为源站已上线，
+//                   不再单独推源站（只把修订号同步过去 + 对齐引用）；加速失败则回退推源站
+//   mirror  镜像站  ：独立站点，各自有修订体系；推送后不会立即同步主站（需等其自身同步），
+//                   也不与其它远程互相复制修订号
+// 例："remotes": { "origin": {"role":"primary"},
+//                  "accel": {"role":"accel","binds":"origin"},
+//                  "mirror": {"role":"mirror"} }
+// ---------------------------------------------------------------------------
+const ROLE_LABEL = { primary: '主站', accel: '加速链接', mirror: '镜像站' };
+
+function resolveRemotes() {
+  const order = (cfg.pushOrder.length ? cfg.pushOrder : [cfg.remote]).slice();
+  const specs = cfg.remotes || {};
+  // 环境变量强制指定顺序（MW_PUSH_ORDER/GWMW_REMOTE）时只推列出的远程；否则把配置里
+  // 其它远程按配置顺序补进来。
+  if (!cfg.pushOrderOnly) {
+    for (const name of Object.keys(specs)) if (!order.includes(name)) order.push(name);
+  }
+  return order.map((name) => {
+    const spec = specs[name] || {};
+    const role = ['primary', 'accel', 'mirror'].includes(spec.role) ? spec.role : 'primary';
+    return {
+      name, role, binds: role === 'accel' ? (spec.binds || null) : null,
+      verifyParity: spec.verifyParity !== false, url: '',
+    };
+  });
+}
+
+// 推送顺序与角色（默认＝pushOrder，每个都是主站）
+const REMOTES = resolveRemotes();
+const REMOTE_NAMES = REMOTES.map((r) => r.name);
+
+function roleLabel(rem) {
+  return `${ROLE_LABEL[rem.role] || rem.role}${rem.binds ? `（绑定 ${rem.binds}）` : ''}`;
+}
+
+// 远程可选选项：verifyParity=false 时不做“加速链接同后端”校验（默认做）
+function wantsParityCheck(rem) {
+  return rem.verifyParity !== false;
+}
+
+// --- 远程可达性预检（DNS/HTTP）------------------------------------------------
+// 非 http(s) 远程（如本地测试用的裸仓路径）直接放过。
+// 目的：加速链接域名解析不了时马上给出明确原因，而不是等 helper 超时 10 分钟。
+async function preflightRemote(rem) {
+  const base = (rem.url || '').replace(/^mediawiki::/, '');
+  if (!/^https?:/i.test(base)) return { ok: true };
+  const url = base.replace(/\/+$/, '') + '/api.php';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(url + '?' + new URLSearchParams({
+      format: 'json', action: 'query', meta: 'siteinfo', siprop: 'general',
+    }), { headers: { 'User-Agent': 'git-mediawiki-tools/publish' }, signal: ctrl.signal });
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}（${url}）` };
+    const data = await res.json();
+    const g = (data.query && data.query.general) || {};
+    return { ok: true, site: g.sitename || '', url };
+  } catch (e) {
+    const code = (e.cause && e.cause.code) || (e.name === 'AbortError' ? '超时' : e.message);
+    return { ok: false, reason: `无法访问 ${url}（${code}）` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- 同后端校验 -------------------------------------------------------------
+// 读站点最近若干条 recentchanges 做指纹（revid + 页面 + 用户）。
+// 同一后端（同一 DB）的两站点，这些信息应当完全一致。
+async function siteFingerprint(rem) {
+  const api = remoteApiUrl(rem);
+  if (!api) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(api + '?' + new URLSearchParams({
+      format: 'json', action: 'query', list: 'recentchanges', rclimit: '5',
+      rctype: 'edit|new', rcprop: 'title|user|timestamp|ids',
+    }), { headers: { 'User-Agent': 'git-mediawiki-tools/publish' }, signal: ctrl.signal });
+    const data = await res.json();
+    const items = (((data.query && data.query.recentchanges) || [])).filter((c) => c.revid)
+      .map((c) => `${c.revid}|${c.title}|${c.user}`);
+    return { items, latest: items.length ? Math.max(...items.map((s) => Number(s.split('|')[0]))) : 0 };
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 纯函数：比对两个指纹（便于测试）
+function compareFingerprints(a, b) {
+  if (!a || !b) return { same: null, diffs: [] };
+  const diffs = [];
+  if (a.latest !== b.latest) diffs.push(`最新修订 ${a.latest} vs ${b.latest}`);
+  const headA = a.items.slice(0, 3).join(' / ');
+  const headB = b.items.slice(0, 3).join(' / ');
+  if (headA !== headB) diffs.push(`最近修订不同：「${headA}」 vs 「${headB}」`);
+  return { same: diffs.length === 0, diffs };
+}
+
+// 加速链接能否代推源站：先验证两者是同一后端（同一 DB、修订号一致）
+async function verifySameBackend(accelRem, srcRem) {
+  if (!wantsParityCheck(accelRem)) return { same: true, skipped: true, diffs: [] };
+  const [a, b] = await Promise.all([siteFingerprint(accelRem), siteFingerprint(srcRem)]);
+  return compareFingerprints(a, b);
+}
+
+// 两个远程是否同一站点（只有 accel ↔ 它绑定的源站才是）——只有同站点才能互相同步修订号；
+// 独立镜像站各有自己的修订体系，复制修订号会破坏它自己的“非快进”判断。
+function sameSite(from, to) {
+  const a = REMOTES.find((x) => x.name === from);
+  const b = REMOTES.find((x) => x.name === to);
+  if (!a || !b) return false;
+  if (a.role === 'accel' && a.binds === b.name) return true;
+  if (b.role === 'accel' && b.binds === a.name) return true;
+  return false;
+}
+
+// 解析 git-mediawiki fetch 输出里的导入修订：`  1/3: Revision #1037 of 页面名`
+function parseImportedRevisions(log) {
+  const out = [];
+  for (const line of log.split('\n')) {
+    const m = line.match(/\d+\/\d+:\s*Revision #(\d+) of (.+?)\s*$/);
+    if (m) out.push({ rev: Number(m[1]), page: m[2].replace(/%2F/g, '/') });
+  }
+  return out;
+}
+
+// 每个远程推送前各自 sync 一次（fetch + 采用/变基）：
+//   - 线上 tip 是本地 HEAD 的后代 → fast-forward 采用（含其内容，避免“丢弃修订”）
+//   - 分叉：base=true 的远程（本次发布的基准远程）或 mirror → rebase；
+//     同 wiki 的兄弟远程（accel/origin 导入链 SHA 不同）→ 不 rebase，交给修订号同步+引用对齐
+async function syncRemote(rem, opts = {}) {
+  const r = rem.name;
+  const fetched = await runWithProgress(['fetch', r]);
+  if (fetched.timedOut || fetched.code !== 0 || FETCH_FAIL_RE.test(fetched.log)) {
+    return { ok: false, reason: '拉取失败/超时', log: fetched.log, imported: [] };
+  }
+  const imported = parseImportedRevisions(fetched.log);
+  const tip = (await runGit(['rev-parse', `refs/remotes/${r}/master`])).out.trim();
+  const head = (await runGit(['rev-parse', 'master'])).out.trim();
+  if (tip && head && tip !== head) {
+    const tipAhead = (await runGit(['merge-base', '--is-ancestor', head, tip])).code === 0;
+    const headAhead = (await runGit(['merge-base', '--is-ancestor', tip, head])).code === 0;
+    if (tipAhead) {
+      await runGit(['reset', '--hard', tip]);
+      console.log(`   ⚠️ ${r} 已有新修订（可能由他人上传），已采用并刷新到本地`);
+    } else if (!headAhead && (opts.base || rem.role === 'mirror')) {
+      const rb = await runWithProgress(['rebase', `${r}/master`]);
+      if (rb.timedOut || rb.code !== 0) {
+        return { ok: false, reason: `变基到 ${r} 失败（可能有冲突）`, log: rb.log, imported };
+      }
+      console.log(`   已变基到 ${r}/master`);
+    } else if (!headAhead) {
+      console.log(`   （${r} 与本地导入链分叉：跳过变基，用修订号同步 + 引用对齐）`);
+    }
+  }
+  return { ok: true, imported, tip, head };
+}
+
+// 该远程对应的 MediaWiki API（由 `git remote get-url` 的 mediawiki::URL 推导）
+function remoteApiUrl(rem) {
+  if (!rem.url) return '';
+  const base = rem.url.replace(/^mediawiki::/, '');
+  if (!/^https?:/i.test(base)) return '';
+  return base.replace(/\/+$/, '') + '/api.php';
+}
+
+// 推送失败后判断是不是「推送期间服务端有人上传」：
+//   helper 在推送前会打印 `Last remote revision found is N.`（推送开始时线上的最大修订号），
+//   失败后用该站点 API 查一次最新修订；若比 N 新 → 说明推送窗口内有人上传/站端编辑。
+async function reportRemoteRace(rem, pushLog) {
+  const m = String(pushLog || '').match(/Last remote revision found is (\d+)/);
+  if (!m) return false;
+  const before = Number(m[1]);
+  const api = remoteApiUrl(rem);
+  if (!api) return false;
+  try {
+    const res = await fetch(api + '?' + new URLSearchParams({
+      format: 'json', action: 'query', list: 'recentchanges', rclimit: '5',
+      rctype: 'edit|new', rcprop: 'title|user|timestamp|ids',
+    }), { headers: { 'User-Agent': 'git-mediawiki-tools/publish' } });
+    const data = await res.json();
+    const rc = ((data.query && data.query.recentchanges) || []).filter((c) => c.revid);
+    const latest = rc.reduce((a, c) => Math.max(a, c.revid), 0);
+    if (latest > before) {
+      const items = rc.filter((c) => c.revid > before).slice(0, 3)
+        .map((c) => `rev${c.revid} ${c.title}（${c.user}）`).join('、');
+      console.log('   ⚠️ 检测到推送期间该站点有新修订：' + items);
+      console.log(`   → ${rem.name}${rem.url ? '（' + rem.url + '）' : ''} 有人上传 / 站端刚编辑`
+        + '（不是本地 notes 落后），请先 `npm run sync` 确认后再重新发布。');
+      return true;
+    }
+  } catch (e) { /* 网络问题不额外报错 */ }
+  return false;
+}
 
 function showProgress(line) {
   const pushed = line.match(/Pushed\s+file:.*\s-\s(.*)$/);
@@ -127,12 +462,19 @@ async function syncRevToRemote(fromRemote, toRemote) {
 
 async function main() {
   // 若第一个参数是已知远程名，视为来源参数并忽略——
-  // 发布始终按配置的 PUSH_ORDER 顺序推送
+  // 发布按配置的远程角色/顺序（primary 主站 / accel 加速链接 / mirror 镜像站）推送
+  // --yes/-y（或环境变量 MW_PUBLISH_YES=1）＝跳过删除确认，供脚本化使用
   let args = process.argv.slice(2);
+  const assumeYes = args.includes('--yes') || args.includes('-y') || process.env.MW_PUBLISH_YES === '1';
+  args = args.filter((a) => !a.startsWith('-'));
   const remotes = (await runGit(['remote'])).out.trim().split(/\s+/).filter(Boolean);
   if (remotes.includes(args[0])) {
-    console.log(`（来源参数 "${args[0]}" 已忽略：发布按 ${PUSH_ORDER.join(' → ')} 顺序推送）`);
+    console.log(`（来源参数 "${args[0]}" 已忽略：发布按 ${REMOTE_NAMES.join(' → ')} 顺序推送）`);
     args = args.slice(1);
+  }
+  for (const rem of REMOTES) {
+    const u = await runGit(['remote', 'get-url', rem.name]);
+    rem.url = u.code === 0 ? u.out.trim() : '';
   }
   const msg = args[0] || `自动提交 via ${cfg.wikiName || 'publish'}`;
   try { execSync('pkill -f "git-remote-mediawiki"', { stdio: 'ignore' }); } catch (e) { /* */ }
@@ -140,20 +482,37 @@ async function main() {
   // 0. 内容树 content/ → 扁平仓库：自动回写，并入发布流程（含冲突检测与页面删除）
   const contentMap = contentSync.scanContent(CONTENT_DIR).map;
   const contentReady = fs.existsSync(CONTENT_DIR) && contentMap.size > 0;
+  let deletePlan = [];
   if (contentReady) {
     console.log('');
     console.log('===== 回写内容树 content/ → 扁平仓库 =====');
+
+    // 0a. 删除预检：页面「content/ 没有、扁平仓库仍跟踪」＝待删除，先列清单并等确认；
+    //     对 git-mediawiki 删不掉的（非 wikitext 内容模型）改为清空 + 同格式注释占位。
+    const pending = contentSync.analyzePublish(REPO_DIR, CONTENT_DIR, REPO_DIR);
+    if (!pending.conflict.length && pending.deletion.length) {
+      deletePlan = await prepareDeletions(pending.deletion, assumeYes);
+    }
+
     const pub = contentSync.applyPublish(REPO_DIR, CONTENT_DIR, REPO_DIR);
     if (!pub.ok) {
       console.log('❌ 检测到内容冲突，发布中止（未改动任何文件）：');
       for (const n of pub.conflict) console.log('   ! ' + n);
       console.log('   原因: 这些页面在 content/ 与扁平仓库被各自修改，需先人工合并后再发布');
-      console.log('   处理: 在 content/ 对应文件与扁平仓库间取一致后，重新运行 node publish.js');
+      if (pub.conflictDiffs && pub.conflictDiffs.length) {
+        console.log(`   ⚠️ 已生成冲突 diff：${pub.conflictDir}`);
+        console.log('   在 VS Code 差异编辑器打开（每行一条，两窗格改成一致后重跑 publish）：');
+        for (const f of pub.conflictDiffs) {
+          console.log('     code --diff "' + f.flat + '" "' + (f.content || '/dev/null') + '"');
+        }
+      } else {
+        console.log('   处理: 在 content/ 对应文件与扁平仓库间取一致后，重新运行 node publish.js');
+      }
       process.exit(1);
     }
     if (pub.written) console.log(`已将 ${pub.written} 个内容树改动回写扁平仓库`);
     if (pub.deletion.length) {
-      console.log(`⚠️ 将从线上删除 ${pub.deletion.length} 个页面（content/ 中已删除）：`);
+      console.log(`⚠️ 已按确认把 ${pub.deletion.length} 个页面从扁平仓库移除（线上将被改写为占位）：`);
       for (const n of pub.deletion) console.log('   - ' + n);
     }
     if (!pub.written && !pub.deletion.length) console.log('（无内容树改动）');
@@ -161,9 +520,9 @@ async function main() {
 
   // 检查是否有改动：未提交的改动 或 未推送的提交
   const st = await runGit(['status', '--porcelain']);
-  const first = PUSH_ORDER[0];
+  const first = REMOTE_NAMES[0];
   const ahead = {};
-  for (const r of PUSH_ORDER) {
+  for (const r of REMOTE_NAMES) {
     ahead[r] = parseInt((await runGit(['rev-list', '--count', `${r}/master..master`])).out.trim(), 10);
   }
   const hasUncommitted = st.out.trim().length > 0;
@@ -189,71 +548,141 @@ async function main() {
     console.log(lg.out.trim());
   }
 
-  // 0. 推送前先用首个远程拉取并变基：把 wiki 上已有的最新修订并入本地，
-  //    否则推送会被 helper 判为非快进而拒绝。首个远程通常是同一 wiki 的快端点；
-  //    只配置一个远程时，它就是主站本身。
-  console.log('');
-  console.log(`===== 推送前同步（fetch ${first} + rebase）=====`);
-  const prefetch = await runWithProgress(['fetch', first]);
-  if (prefetch.timedOut || prefetch.code !== 0) {
-    console.log('--- 拉取日志（尾部）---');
-    console.log(prefetch.log.trim().split('\n').slice(-10).join('\n'));
-    console.log('❌ 推送前拉取失败/超时（网络或 wiki 响应慢）');
-    process.exit(1);
-  }
-  const preRebase = await runWithProgress(['rebase', `${first}/master`]);
-  if (preRebase.timedOut || preRebase.code !== 0) {
-    console.log('--- 变基日志（尾部）---');
-    console.log(preRebase.log.trim().split('\n').slice(-10).join('\n'));
-    console.log('❌ 推送前变基失败（可能有冲突）');
-    console.log('提示: 解决冲突后运行 git rebase --continue，或中止 git rebase --abort');
-    process.exit(1);
-  }
-  console.log('同步完成');
-
-  // 1. 依序推送 PUSH_ORDER 中的远程（首个往往是最快/主推端点）
+  // 1. 逐远程：每个先各自 sync（fetch + 采用线上新修订 / 变基），再推送。
+  //    角色：主站必推；加速链接成功后其绑定源站视为已上线（跳过源站推送，只同步修订号+对齐引用）；
+  //    镜像站独立推送（推送后不会立即同步主站，需等其自身同步）。
   const results = {};
+  const skipped = [];
+  const covered = new Set();     // 已被加速链接代推的远程
   let lastOk = null;
-  for (const r of PUSH_ORDER) {
-    if (lastOk && lastOk !== r) {
-      await syncRevToRemote(lastOk, r);   // 把上一远程修订号同步给当前远程
+  for (const rem of REMOTES) {
+    const r = rem.name;
+    if (covered.has(r)) {
+      const accelRem = REMOTES.find((x) => x.name === lastOk);
+      const verdict = accelRem && accelRem.binds === r
+        ? await verifySameBackend(accelRem, rem) : { same: null, diffs: [] };
+      if (verdict.same !== true) {
+        console.log('');
+        console.log(verdict.same === false
+          ? `⚠️ 加速链接 ${lastOk} 与其绑定源站 ${r} 看起来不是同一后端，不能代推：`
+          : `⚠️ 无法校验加速链接 ${lastOk} 与源站 ${r} 是否同一后端（站点 API 不可用），保守起见不代推：`);
+        for (const d of verdict.diffs) console.log('   - ' + d);
+        console.log(`   → 继续单独推送 ${r}（确定是同一后端、想跳过校验时，给 ${lastOk} 加 "verifyParity": false）`);
+        covered.delete(r);   // 落到下面正常推送
+      } else {
+        console.log('');
+        console.log(`===== 跳过 ${r}（${roleLabel(rem)}）：内容已由加速链接 ${lastOk} 上线`
+          + `${verdict.skipped ? '（已按配置跳过同后端校验）' : '（已校验两站修订一致）'} =====`);
+        if (lastOk && lastOk !== r) await syncRevToRemote(lastOk, r);
+        await alignRefs(r);
+        results[r] = true;
+        skipped.push(`${r}（由 ${lastOk} 代推）`);
+        continue;
+      }
+    }
+    if (rem.role === 'accel' && rem.binds && results[rem.binds]) {
+      console.log('');
+      console.log(`===== 跳过 ${r}（${roleLabel(rem)}）：绑定源站 ${rem.binds} 已推送成功 =====`);
+      results[r] = true;
+      skipped.push(`${r}（源站 ${rem.binds} 已推送）`);
+      continue;
     }
     console.log('');
-    console.log(`===== 推送 ${r} =====`);
-    const pr = await runWithProgress(['push', r]);
+    console.log(`===== 同步 + 推送 ${r}（${roleLabel(rem)}${rem.url ? '，' + rem.url : ''}）=====`);
+    const pre = await preflightRemote(rem);
+    if (!pre.ok) {
+      console.log(`❌ ${r} 预检失败：${pre.reason}`);
+      console.log('   （地址解析不了 / 站点不可达；跳过该远程，继续其它远程）');
+      results[r] = false;
+      continue;
+    }
+    if (pre.site) console.log(`   站点：${pre.site}`);
+    const sync = await syncRemote(rem, { base: !lastOk });
+    if (!sync.ok) {
+      console.log(`❌ ${r} ${sync.reason}`);
+      console.log(sync.log.trim().split('\n').slice(-10).join('\n'));
+      results[r] = false;
+      continue;
+    }
+    if (lastOk && lastOk !== r && sameSite(lastOk, r)) {
+      await syncRevToRemote(lastOk, r);   // 同一站点：把上一远程修订号同步给当前远程
+    }
+    const pr = await runWithProgress(['push', r, 'master:master']);   // 显式 refspec：不依赖 branch.<b>.remote 上游配置（新镜像站首次推送也能用）
     const ok = pr.code === 0 && !pr.timedOut;
     showPushResult(r, ok, pr.log);
     results[r] = ok;
     if (ok) {
       await alignRefs(r);
       lastOk = r;
+      if (rem.role === 'accel' && rem.binds) covered.add(rem.binds);
+    } else {
+      await reportRemoteRace(rem, pr.log);   // 推送期间服务端是否有人上传
     }
   }
 
-  const okList = PUSH_ORDER.filter((r) => results[r]);
-  const failList = PUSH_ORDER.filter((r) => !results[r]);
+  const okList = REMOTE_NAMES.filter((r) => results[r]);
+  const failList = REMOTE_NAMES.filter((r) => !results[r]);
   if (!okList.length) {
     console.log('');
     console.log('❌ 全部推送失败/超时（wiki 上可能有他人更新，或网络慢）');
-    console.log('提示: 请先运行 node sync.js 再重试');
+    console.log('提示: 请先运行 npm run sync 再重试');
     process.exit(1);
   }
   if (failList.length) {
     console.log('');
     console.log(`⚠️  已成功推送 ${okList.join('、')}，但 ${failList.join('、')} 失败/超时`);
-    console.log('   可稍后运行 node sync.js 同步追踪');
+    const failed = REMOTES.filter((x) => !results[x.name]);
+    const accelFailed = failed.filter((x) => x.role === 'accel' && x.binds);
+    if (accelFailed.length) {
+      console.log(`   加速链接失败时会回退推送其绑定源站（${accelFailed.map((x) => x.binds).join('、')}）`);
+    }
+    console.log('   可稍后运行 npm run sync 同步追踪');
+    if (failed.some((x) => x.role === 'mirror')) {
+      console.log('   镜像站若是首次推送，需先播种它的引用与 notes（git-mediawiki 要求，见 README）；\n'
+        + '   独立镜像站的修订号体系与主站不同，不能互相对齐。');
+    }
+  }
+  if (skipped.length) {
+    console.log('');
+    console.log(`ℹ️  未单独推送：${skipped.join('、')}`);
+    console.log('   加速链接与其绑定源站是同一站点，内容已经上线；若要强制单独推源站：'
+      + 'MW_PUSH_ORDER=<源站> npm run publish -- "说明"');
+  }
+  const mirrorOk = REMOTES.filter((x) => x.role === 'mirror' && results[x.name]);
+  if (mirrorOk.length) {
+    console.log(`ℹ️  镜像站已推送：${mirrorOk.map((x) => x.name).join('、')}`
+      + '（镜像站不会立即同步主站，需等待其自身同步）');
   }
 
-  // 4. 推送后最终同步：导入修订 + 对齐所有远程引用到 master。
+  // 4. 推送后最终同步：导入修订 + 对齐“同站点”远程引用到 master。
   //    不用 git pull：mediawiki 远程的 FETCH_HEAD 会写多条导致
   //    "Cannot rebase onto multiple branches"。
+  //    两个要点：① 推送窗口内线上又更新时**采用**新修订（不能反向对齐丢内容）；
+  //    ② 只对齐本次推送成功的同站点远程，失败/独立镜像站的引用保持不动，
+  //       否则本地会误判为“已同步”，下次发布不再重试。
   console.log('');
   console.log('===== 推送后同步（导入修订 + 对齐引用）=====');
   const pf = await runWithProgress(['fetch', first]);
-  for (const r of PUSH_ORDER) await alignRefs(r);
+  const afterImported = parseImportedRevisions(pf.log);
+  const tip2 = (await runGit(['rev-parse', `refs/remotes/${first}/master`])).out.trim();
+  const head2 = (await runGit(['rev-parse', 'master'])).out.trim();
+  if (tip2 && head2 && tip2 !== head2
+      && (await runGit(['merge-base', '--is-ancestor', head2, tip2])).code === 0) {
+    await runGit(['reset', '--hard', tip2]);
+    console.log(`⚠️ 推送后 ${first} 又有新修订：`
+      + (afterImported.length ? afterImported.map((i) => `rev${i.rev} ${i.page}`).join('、') : '（见日志）')
+      + '，已并入本地');
+  }
+  const sameGroup = REMOTE_NAMES.filter((r) => r === first || sameSite(first, r));
+  for (const r of sameGroup) {
+    if (r !== first && !results[r]) continue;   // 未推成功的不要对齐（会掩盖待推送内容）
+    await alignRefs(r);
+  }
+  const onlyNames = REMOTE_NAMES.filter((r) => !sameGroup.includes(r));
+  if (onlyNames.length) console.log(`（${onlyNames.join('、')} 属独立站点，引用各自保留）`);
   console.log('--- 同步日志 ---');
   console.log(pf.log.trim().split('\n').slice(-3).join('\n'));
-  console.log('引用已对齐到 master');
+  console.log(`引用已对齐到 master（同站点远程：${sameGroup.join('、')}）`);
 
   // 4b. 内容树刷新：把扁平侧的改动（含直接改 .mw 的扁平直改/新增）同步回 content/，
   //     使发布后两侧保持一致（已删除页面不会复活）。
@@ -271,6 +700,9 @@ async function main() {
   if (cfg.jsonContentModels) {
     await ensureJsonContentModels();
   }
+
+  // 6. 删除遗留提醒：git-mediawiki 的“删除”只是把正文改写为占位，页面需在线上真正删除。
+  reportDeletions(deletePlan);
 }
 
 // 找出仓库里内容为合法 JSON 的 .mw 页面（如 命名空间:数据页/Data）
@@ -383,4 +815,11 @@ async function ensureJsonContentModels() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  main, prepareDeletions, reportDeletions, flatTitle, fetchContentModels,
+  resolveRemotes, syncRemote, parseImportedRevisions, reportRemoteRace,
+  preflightRemote, siteFingerprint, compareFingerprints, verifySameBackend,
+  STUB_CONTENT, WIKITEXT_DELETED,
+};

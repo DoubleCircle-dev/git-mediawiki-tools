@@ -17,6 +17,9 @@ const cfg = require('../lib/config.js').load();
 const REPO_DIR = cfg.wikiRepo;
 const CONTENT_DIR = cfg.contentDir;
 const TIMEOUT_MS = cfg.timeoutMs; // 硬超时
+// ⚠️ git-mediawiki 的 helper 失败时，`git fetch` 仍可能返回 0（git 视为“无新引用”），
+// 失败信息只在输出里；若不识别会把失败当成功，用陈旧引用继续。
+const FETCH_FAIL_RE = /Failed to log in|Can't connect|could not read ref|fatal:|error:/i;
 
 // 内容树同步模块（content/ <-> 扁平仓库）
 const contentSync = require('./content-sync.js');
@@ -96,7 +99,7 @@ async function main() {
   // 1) 拉取（更新 refs/remotes/<remote>/master）
   console.log('--- 拉取中 ---');
   const fetch = await runWithProgress(['fetch', REMOTE]);
-  if (fetch.timedOut || fetch.code !== 0) {
+  if (fetch.timedOut || fetch.code !== 0 || FETCH_FAIL_RE.test(fetch.log)) {
     console.log('');
     console.log('--- 拉取日志（尾部）---');
     console.log(fetch.log.trim().split('\n').slice(-10).join('\n'));
@@ -108,7 +111,7 @@ async function main() {
   // 2) 变基（用显式 ref，避免 git pull 对 mediawiki 远程产生多分支报错）
   console.log('--- 合并本地提交到最新 ---');
   const rebase = await runWithProgress(['rebase', `${REMOTE}/master`]);
-  if (rebase.timedOut || rebase.code !== 0) {
+  if (rebase.timedOut || rebase.code !== 0 || FETCH_FAIL_RE.test(rebase.log)) {
     console.log('');
     console.log('--- 变基日志（尾部）---');
     console.log(rebase.log.trim().split('\n').slice(-10).join('\n'));

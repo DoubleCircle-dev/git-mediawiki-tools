@@ -57,7 +57,7 @@ node bin/sync.js
 
 ## 配置（config.json）
 
-由 `lib/config.js` 加载，优先级：环境变量 `GWMW_CONFIG` 指定的 JSON > 仓库根 `config.json` > 内置默认。`GWMW_REMOTE` 可临时覆盖 `remote` / `pushOrder`（逗号分隔）。
+由 `lib/config.js` 加载，优先级：环境变量 `GWMW_CONFIG` 指定的 JSON > 仓库根 `config.json` > 内置默认。`GWMW_REMOTE` 可临时覆盖 `remote` / `pushOrder`（逗号分隔）；`MW_PUSH_ORDER` 也可临时覆盖推送顺序（效果相同，发布脚本专用）。
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -66,6 +66,7 @@ node bin/sync.js
 | `apiUrl` | — | MediaWiki API 地址；JSON 数据页修正用 |
 | `remote` | `origin` | 主 mediawiki 远程名 |
 | `pushOrder` | `["origin"]` | 推送顺序；同一 wiki 有镜像端点时可 `["accel","origin"]` |
+| `remotes` | `{}` | 远程角色：`{"accel":{"role":"accel","binds":"origin"},"mirror":{"role":"mirror"}}`（见「远程角色」；可选 `"verifyParity": false` 跳过同后端校验） |
 | `wikiRepo` | `wiki.mywiki` | 扁平 git-mediawiki 仓库目录（相对本工具根或绝对） |
 | `contentDir` | `content` | 内容树目录（相对本工具根或绝对） |
 | `namespaces` | 标准集 | 纳入管理的命名空间（不含主命名空间与 File 图片） |
@@ -80,7 +81,7 @@ node bin/sync.js
 
 | 命令 | 作用 |
 |------|------|
-| `node bin/publish.js "说明"` | 提交本地改动并推送（可再给远程名参数会忽略，始终按 `pushOrder` 推） |
+| `node bin/publish.js "说明"` | 提交本地改动并推送（可再给远程名参数会忽略，始终按 `pushOrder` 推；`MW_PUSH_ORDER=origin` 可临时覆盖；`--yes` 跳过待删页确认） |
 | `node bin/sync.js [远程]` | 拉取远程（缺省主 remote）并变基、整理进 content/ |
 | `node bin/set-pass.js [用户]` | 设置登录凭据（写入 `remote.<remote>.mwlogin/mwpassword`） |
 | `node bin/content-sync.js status` | 查看两侧差异（`!` = 冲突） |
@@ -152,13 +153,45 @@ node bin/preview.js import <file>...  # 一次性导入指定 .mw / 图片
 
 ### 同一 wiki 多镜像（快 / 慢端点）
 
-若你的 wiki 有加速镜像（同一后端、revision 一致），把它作为 `pushOrder` 的**首位**可显著提速并避免主站推送被非快进检查拒绝：
+### 远程角色：主站 / 加速链接 / 镜像站
+
+用 `remotes` 给每个远程标角色，决定推送顺序与「谁能代替谁」（未配置时 `pushOrder` 里每个远程都按 `primary`，即旧行为）：
 
 ```json
-{ "pushOrder": ["accel", "origin"] }
+{
+  "pushOrder": ["accel", "origin", "mirror"],
+  "remotes": {
+    "accel":  { "role": "accel", "binds": "origin" },
+    "origin": { "role": "primary" },
+    "mirror": { "role": "mirror" }
+  }
+}
 ```
 
-发布脚本会在首位推送成功后，把其记录的最新修订号同步到后续远程的 notes 并逐一对齐引用。
+| 角色 | 含义 | 推送行为 |
+|------|------|----------|
+| `primary` 主站 | 主要推送的站点 | 必须推；失败时发布报错（其余远程继续尝试） |
+| `accel` 加速链接 | **绑定某个源站（`binds`）的同一 wiki 端点**（同一后端、修订号一致） | 先推它；成功后**跳过其绑定源站的推送**（内容已经上线），只把修订号同步给源站 notes + 对齐引用；它失败则自动回退、继续推源站 |
+| `mirror` 镜像站 | **独立站点**（自己的修订号体系） | 各自单独推；与主站互不复制修订号；推送后不会立即同步主站，需等待镜像自身的同步 |
+
+每个远程在推送前都会**各自 sync 一次**（`fetch` + 采用线上新修订/变基）：若线上 tip 领先本地
+（例如推送窗口内有人编辑），直接 fast-forward 采用，不会再把新修订丢掉。
+推送失败时，脚本读 helper 打印的 `Last remote revision found is N`，再查该站点 API：
+若最新修订 > N 就提示「**该仓库有人上传 / 站端刚编辑**」并建议先 `npm run sync`；
+失败远程的跟踪引用**不会**被对齐，以免被误判成已同步、下次不再重试。
+
+**两道保护（加速链接相关）**：
+
+1. **推送前可达性预检**：对 http(s) 远程先 GET 一次 `api.php`（15s 超时）。地址解析不了 /
+   站点不可达会在 1 秒内报「❌ accel 预检失败：无法访问 …（ENOTFOUND）」，
+   而不是让 helper 空等超时；随后继续其它远程。
+2. **同后端校验**：`accel` 推送成功、准备跳过其 `binds` 源站之前，比对两站点最近 5 条
+   `recentchanges`（revid + 页面 + 用户）。**只有完全一致才跳过源站**；不一致会列出差异并
+   **照常单独推源站**；查不到（站点 API 不可用）也一律保守不跳过。
+   确实同后端、想省掉这次校验时，给该 accel 远程加 `"verifyParity": false`。
+
+临时只推指定远程（例如加速链接下线了、只想走主站）：
+`MW_PUSH_ORDER=origin node bin/publish.js "说明"`（此时配置里的其它远程不会补进来）。
 
 ### JSON 数据页（如 命名空间:某页/Data）
 
@@ -169,6 +202,7 @@ node bin/preview.js import <file>...  # 一次性导入指定 .mw / 图片
 - **推送被拒 non-fast-forward**：说明远程有你本地没有的修订。先 `node bin/sync.js` 同步；若本地 notes 修订号落后于远程（例如站端直接编辑产生了新修订而 recentchanges 滞后），需要把本地 notes 播种到远程实际修订号后重推。
 - **受保护页面无法推送**：如 `MediaWiki:Common.css` 等受保护页面机器人无权限，推送会整体失败。把该页面从推送历史中剔除（`git rebase -i` 合并提交），样式改走 TemplateStyles 子页。
 - **内容树冲突**：`content/` 与扁平仓库两侧各自改了同一页 → 发布中止并列出。把该页在两处取一致后重跑即可。
+- **删除页面**：`content/` 中删掉的页面会被当成待删除，publish 先列出清单并等确认（`--yes` / `MW_PUBLISH_YES=1` 跳过；**非交互终端必须显式确认**）。注意 git-mediawiki **无法真正删网页**，只能改写正文：wikitext 页写成 `[[Category:Deleted]]`；Scribunto / sanitized-css / CSS / JS / JSON 页因内容校验无法接受该文本，会自动改写为**同格式注释占位**（Lua `-- …`、CSS `/* … */`、JS `// …`、JSON `{"_comment": …}`）。发布末尾会提醒这些页面仍需在线上用 `Special:Delete` 或 API `action=delete` 真正删除。
 - **新增命名空间后旧页被跳过**：命名空间变更后需要完整重导（删除 notes 重新 clone），否则旧页面会被全局修订号跳过。
 
 ## 许可

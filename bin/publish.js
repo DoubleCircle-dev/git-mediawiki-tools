@@ -11,9 +11,14 @@
  *                        不再单独推源站（只把修订号同步过去 + 对齐引用）；失败则回退推源站
  *   mirror  镜像站    —— 独立站点，各自有修订体系；推送后不会立即同步主站，需等其自身同步
  *
- * 用法: node publish.js [提交说明] [--yes]
+ * 用法: node publish.js [提交说明] [--yes] [--no-media]
  * 示例: node publish.js "更新首页模板"
  *   --yes / -y（或 MW_PUBLISH_YES=1）：跳过「待删除页面」的确认。
+ *   --no-media（或 MW_NO_MEDIA=1、config.uploadMedia=false）：跳过发布收尾的媒体上传。
+ *   媒体上传：git-mediawiki 不推二进制媒体（扁平仓库设 mediaexport=false，push 时
+ *   打印 "Ignoring media file …"），图片一律走 API；发布收尾会 best-effort 比对
+ *   content/images 与远端并上传差异，失败只提示原因与重跑命令，不影响、也不回滚
+ *   已经完成的页面推送（退出码不变）。
  *   删除语义：git-mediawiki 无法真正删网页，只能改写正文（wikitext 页写
  *   [[Category:Deleted]]；Scribunto/CSS/JS/JSON 页写同格式注释占位）——
  *   被删页面仍会在线上存在，发布末尾会提醒去线上真正删除。
@@ -466,6 +471,8 @@ async function main() {
   // --yes/-y（或环境变量 MW_PUBLISH_YES=1）＝跳过删除确认，供脚本化使用
   let args = process.argv.slice(2);
   const assumeYes = args.includes('--yes') || args.includes('-y') || process.env.MW_PUBLISH_YES === '1';
+  // 收尾的媒体上传开关：--no-media / MW_NO_MEDIA=1 / config.uploadMedia=false
+  const noMedia = args.includes('--no-media') || process.env.MW_NO_MEDIA === '1' || cfg.uploadMedia === false;
   args = args.filter((a) => !a.startsWith('-'));
   const remotes = (await runGit(['remote'])).out.trim().split(/\s+/).filter(Boolean);
   if (remotes.includes(args[0])) {
@@ -536,7 +543,14 @@ async function main() {
   const hasUnpushed = Object.values(ahead).some((n) => n > 0);
 
   if (!hasUncommitted && !hasUnpushed) {
-    console.log('没有需要发布的改动（工作树干净且无未推送提交）');
+    console.log('没有需要发布的页面改动（工作树干净且无未推送提交）');
+    // 页面没有改动 ≠ 媒体没有差异：媒体走独立 API 通道（不随 push 上线），
+    // 所以这里仍做一次 best-effort 媒体上传，让「只加了图片」也能一条命令搞定。
+    if (noMedia) {
+      console.log('（已跳过媒体上传：--no-media / MW_NO_MEDIA=1 / config.uploadMedia=false）');
+    } else {
+      await uploadMediaBestEffort();
+    }
     return;
   }
 
@@ -700,6 +714,18 @@ async function main() {
       + (r.skippedDelete ? `，跳过 ${r.skippedDelete} 个已删除页面` : ''));
   }
 
+  // 4c. 媒体上传（best-effort）：git-mediawiki 不推二进制媒体（扁平仓库设了
+  //     remote.<remote>.mediaexport=false，push 时打印 "Ignoring media file …"），
+  //     图片一律走 API 上传；这里在页面推送完成后顺带补齐差异。
+  //     刻意放在推送之后且整体 try/catch：媒体失败只提示原因与重跑命令，
+  //     不影响、也不回滚已经完成的页面推送（退出码不变）。
+  if (noMedia) {
+    console.log('');
+    console.log('（已跳过媒体上传：--no-media / MW_NO_MEDIA=1 / config.uploadMedia=false）');
+  } else {
+    await uploadMediaBestEffort();
+  }
+
 
   // 5. 推送后修正内容模型：
   //    - MediaWiki 命名空间的 .js / .css 子页 → javascript / css：git-remote-mediawiki
@@ -710,6 +736,21 @@ async function main() {
 
   // 6. 删除遗留提醒：git-mediawiki 的“删除”只是把正文改写为占位，页面需在线上真正删除。
   reportDeletions(deletePlan);
+}
+
+// 发布收尾的媒体上传（best-effort）：失败只提示原因 + 重跑命令，
+// 一律不改退出码、不抛异常，确保页面推送的结果不被媒体问题牵动。
+async function uploadMediaBestEffort() {
+  console.log('');
+  console.log('===== 媒体上传（best-effort；媒体不随 push 上线）=====');
+  try {
+    const media = require('../lib/upload-media.js');
+    const r = await media.syncMedia({ log: (s) => console.log(s), header: false });
+    for (const line of media.formatBestEffort(r)) console.log(line);
+  } catch (e) {
+    console.log(`⚠️ 媒体上传异常，已跳过（页面推送已完成）：${e.message}`);
+    console.log('   ↳ 稍后可单独重跑：node bin/upload-media.js');
+  }
 }
 
 // 找出仓库里内容为合法 JSON 的 .mw 页面（如 命名空间:数据页/Data）

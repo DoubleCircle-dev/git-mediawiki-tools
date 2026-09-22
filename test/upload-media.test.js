@@ -87,6 +87,72 @@ test('媒体名归一：API 的下划线名与本地空格名可比对', () => {
   assert.strictEqual(LIB.normName('  已压缩.png '), '已压缩.png');
 });
 
+test('explainFailure：只有超过 10MB 才提示压缩，否则按「忽略警告」处理', () => {
+  const why = 'paramvalidator-badupload-inisize: The file is bigger than the maximum size';
+
+  const small = LIB.explainFailure(why, { sizeBytes: 3 * 1024 * 1024 });
+  assert.doesNotMatch(small, /ffmpeg/, '未超阈值不应提示压缩');
+  assert.match(small, /忽略警告/);
+
+  const big = LIB.explainFailure(why, { sizeBytes: 11 * 1024 * 1024 });
+  assert.match(big, /ffmpeg/);
+  assert.match(big, /11\.0MB/);
+  assert.match(big, /10\.0MB/);
+});
+
+test('未超 10MB 的上传失败会忽略警告重试一次（重试成功计入已上传）', async () => {
+  const http = require('node:http');
+  let uploads = 0;
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      let payload;
+      if (req.url.includes('meta=tokens')) {
+        payload = { query: { tokens: { logintoken: 'lt', csrftoken: 'ct' } } };
+      } else if (body.includes('action=login')) {
+        payload = { login: { result: 'Success', lgusername: 'Tester' } };
+      } else if (req.url.includes('list=allimages')) {
+        payload = { query: { allimages: [] } };
+      } else {
+        uploads += 1;
+        // 第一次用「警告」拒绝（模拟 exists 之类），第二次成功
+        payload = uploads === 1
+          ? { upload: { result: 'Warning', warnings: { exists: {} } } }
+          : { upload: { result: 'Success' } };
+      }
+      res.end(JSON.stringify(payload));
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  try {
+    const repo = makeRepo();
+    const content = path.join(repo, 'content');
+    fs.mkdirSync(path.join(content, 'images'), { recursive: true });
+    fs.writeFileSync(path.join(content, 'images', 'shot.png'), Buffer.from('not-a-real-png'));
+
+    const r = await LIB.syncMedia({
+      cfg: {
+        wikiRepo: repo,
+        contentDir: content,
+        remote: 'origin',
+        apiUrl: `http://127.0.0.1:${port}/api.php`,
+      },
+      log: () => {},
+    });
+
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(uploads, 2, '应恰好重试一次');
+    assert.strictEqual(r.uploaded.length, 1);
+    assert.strictEqual(r.uploaded[0].retried, true, '应记录为重试后成功');
+    assert.strictEqual(r.failed.length, 0);
+  } finally {
+    srv.close();
+  }
+});
+
 test('isMedia：只认图片/PDF 扩展名', () => {
   assert.ok(LIB.isMedia('a.png'));
   assert.ok(LIB.isMedia('a.JPEG'));

@@ -20,7 +20,7 @@
   ],
   "defaultUser": "",
   "jsonContentModels": false,
-  "_媒体上传": "publish 收尾会 best-effort 比对 content/images 与远端并上传差异（媒体不随 push 上线）；false 可关闭，也可用 --no-media / MW_NO_MEDIA=1 单次跳过。失败不影响页面推送。",
+  "_媒体上传": "publish 收尾会 best-effort 比对 content/images 与远端并上传差异（媒体不随 push 上线）；false 可关闭，也可用 --no-media / MW_NO_MEDIA=1 单次跳过。失败不影响页面推送；超过 10MB 的失败才提示先压缩，其余失败会自动忽略警告重试一次。",
   "uploadMedia": true,
   "timeoutMs": 180000,
   "_本地预览(可选)": "下面 preview.* 供 bin/preview.js 使用：本地装一套 MediaWiki(php -S+SQLite) 后，把 .mw 导入预览、保存即刷新；exit 自动精简版本历史与图片归档。不需要可整段留空。",

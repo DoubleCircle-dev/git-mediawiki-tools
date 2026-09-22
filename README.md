@@ -9,7 +9,7 @@
 - **Git 原生冲突处理**：当 content/ 与扁平仓库分别修改同一页面时，工具将冲突写入 Git 索引并标记为 `UU`，禁止静默覆盖；用户可使用 VS Code 内置合并编辑器处理冲突。
 - **多远程支持**：同一 Wiki 可配置多个远程端点，并按照指定顺序推送和对齐修订号，以降低 `non-fast-forward` 错误风险。
 - **JSON 数据页支持**：可在发布后将内容为合法 JSON 的 `.mw` 页面修正为 `json` 内容模型，使 `/Data` 等数据页面按数据视图展示。
-- **媒体批量上传**：`upload-media` 按 SHA1 比对远端同名文件，只上传缺失或不一致者；用于规避 git-remote-mediawiki 在本机 Perl 下推送媒体崩溃（`HTTP::Message content must be bytes`）的问题，Git 侧只负责页面。`publish` 收尾也会自动执行一次（best-effort，失败不影响页面推送）。
+- **媒体批量上传**：`upload-media` 按 SHA1 比对远端同名文件，只上传缺失或不一致者；用于规避 git-remote-mediawiki 在本机 Perl 下推送媒体崩溃（`HTTP::Message content must be bytes`）的问题，Git 侧只负责页面。`publish` 收尾也会自动执行一次（best-effort，失败不影响页面推送）。超过 10MB 的文件失败时才提示先压缩（附 ffmpeg 命令）；未超 10MB 的失败会自动忽略警告重试一次。
 - **零第三方依赖**：仅使用 Node.js 内置模块，无需执行 `npm install`。
 
 ## 前置依赖

@@ -894,9 +894,15 @@ function conflictNames(flatDir, contentDir, repo) {
 }
 
 // git index 里处于未解决（unmerged）状态的路径
+// 必须加 -z（配合 core.quotepath=false）：否则 git 会把非 ASCII / 特殊字符路径
+// 转义成 "Template:\351\273\221..." 并**连引号一起**输出，同一个页面会被当成两个
+// 不同的名字（例如「未解决 2 个」其实只有 1 个），`already` 判重也会失效、
+// 进而覆盖你在合并编辑器里正在做的解决结果。
 function listUnmergedPaths(repo) {
-  const r = spawnSync('git', ['diff', '--name-only', '--diff-filter=U'], { cwd: repo, encoding: 'utf8' });
-  return (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+  const r = spawnSync('git',
+    ['-c', 'core.quotepath=false', 'diff', '--name-only', '--diff-filter=U', '-z'],
+    { cwd: repo, encoding: 'utf8' });
+  return String(r.stdout || '').split('\0').map((s) => s.trim()).filter(Boolean);
 }
 
 function gitHashObject(repo, buf) {

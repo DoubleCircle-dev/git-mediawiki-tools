@@ -525,7 +525,8 @@ async function main() {
   }
 
   // 检查是否有改动：未提交的改动 或 未推送的提交
-  const st = await runGit(['status', '--porcelain']);
+  // （core.quotepath=false：中文页名按原样输出，不转义成 \351\273\221 这类乱码）
+  const st = await runGit(['-c', 'core.quotepath=false', 'status', '--porcelain']);
   const first = REMOTE_NAMES[0];
   const ahead = {};
   for (const r of REMOTE_NAMES) {

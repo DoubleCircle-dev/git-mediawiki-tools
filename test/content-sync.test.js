@@ -665,6 +665,56 @@ test('git-merge：二进制图片 / 删除类冲突跳过（仍走 diff 流程�
   assert.strictEqual(fs.readFileSync(path.join(FLAT, 'A.mw'), 'utf8'), 'v3 flat\n');
 });
 
+// 中文页名（扁平仓库里是 Template:黑幕组%2Fdoc.mw）：git 默认 core.quotepath=true 会把
+// 它转义成 "Template:\351\273\221..." 连引号一起输出 —— 若解析时不去掉，同一个页面会被
+// 当成两个不同的名字（「未解决 2 个」其实只有 1 个），判重失效还会覆盖合并编辑器里的结果。
+test('git 冲突：中文页名不被 git 转义（同一页只算 1 个，且能正常收尾）', () => {
+  const PAGE = 'Template:黑幕组%2Fdoc.mw';
+  baseline({ [PAGE]: 'v1\n' });
+  const cp = contentPath(PAGE);
+  write(cp, 'v2 content\n');
+  write(path.join(FLAT, PAGE), 'v3 flat\n');
+
+  assert.strictEqual(cli(['git-merge']).status, 0);
+  // 原生 git 输出是转义过的（这正是坑），工具内部必须还原成真实页名
+  assert.match(sh('git', ['diff', '--name-only', '--diff-filter=U'], FLAT), /\\351/);
+  assert.deepStrictEqual(cs.listUnmergedPaths(FLAT), [PAGE]);
+
+  const blocked = cli(['flatten']);
+  assert.strictEqual(blocked.status, 1);
+  assert.match(blocked.stdout, /仍有 1 个未解决/);      // 曾经会错报成 2 个
+  assert.match(blocked.stdout, /Template:黑幕组%2Fdoc\.mw/);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), 'v2 content\n', '未解决时不得写回');
+
+  // 等价于 VS Code 合并编辑器「完成合并」
+  write(path.join(FLAT, PAGE), '合并结果\n');
+  sh('git', ['add', '--', PAGE], FLAT);
+
+  const r = cli(['flatten']);
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /git 合并冲突已解决 1 个/);
+  assert.strictEqual(fs.readFileSync(cp, 'utf8'), '合并结果\n');
+  assert.deepStrictEqual(cs.listUnmergedPaths(FLAT), []);
+});
+
+test('git-merge：已在 git 里冲突的页不会被重复写一遍（判重不能漏，否则覆盖合并中的结果）', () => {
+  const PAGE = 'Template:黑幕组%2Fdoc.mw';
+  baseline({ [PAGE]: 'v1\n' });
+  write(contentPath(PAGE), 'v2 content\n');
+  write(path.join(FLAT, PAGE), 'v3 flat\n');
+  assert.strictEqual(cli(['git-merge']).status, 0);
+
+  // 模拟：已经用合并编辑器写出了结果（还带标记，属「解决中」）
+  const inProgress = '半成品，尚未点「完成合并」\n';
+  write(path.join(FLAT, PAGE), inProgress);
+
+  const again = cli(['git-merge']);
+  assert.strictEqual(again.status, 0, again.stdout + again.stderr);
+  assert.match(again.stdout, /没有可写入 git 的冲突/);
+  assert.strictEqual(fs.readFileSync(path.join(FLAT, PAGE), 'utf8'), inProgress,
+    '不该被重新写成 <<<<<<< 标记版');
+});
+
 // 全部跑完清理沙盒（失败时保留现场便于排查）
 after(() => {
   if (!process.env.KEEP_TEST_SANDBOX) fs.rmSync(ROOT, { recursive: true, force: true });

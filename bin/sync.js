@@ -140,7 +140,7 @@ async function main() {
   console.log(lg.out.trim());
   console.log('');
   console.log('本地未提交改动:');
-  const st = await runGit(['status', '--short']);
+  const st = await runGit(['-c', 'core.quotepath=false', 'status', '--short']);
   console.log(st.out.trim() || '（无）');
 
   // 5) 内容树整理：扁平仓库（已含线上最新）→ content/

@@ -701,12 +701,12 @@ async function main() {
   }
 
 
-  // 5. 可选：确保 JSON 数据页使用 JSON 内容模型（config.json 的 jsonContentModels=true 时启用）。
-  //    git-remote-mediawiki 导入默认按 wikitext 创建页面，导致 /Data 这类
-  //    数据页以纯文本显示而非 JSON 数据视图，这里推送后统一修正。
-  if (cfg.jsonContentModels) {
-    await ensureJsonContentModels();
-  }
+  // 5. 推送后修正内容模型：
+  //    - MediaWiki 命名空间的 .js / .css 子页 → javascript / css：git-remote-mediawiki
+  //      默认按 wikitext 创建新页面，Gadgets / ResourceLoader 会拒绝加载模型不符的脚本页；
+  //    - JSON 数据页 → json（config.json 的 jsonContentModels=true 时启用）：否则 /Data
+  //      这类数据页会以纯文本显示而非 JSON 数据视图。
+  await ensureContentModels();
 
   // 6. 删除遗留提醒：git-mediawiki 的“删除”只是把正文改写为占位，页面需在线上真正删除。
   reportDeletions(deletePlan);
@@ -727,13 +727,32 @@ function listJsonDataFiles() {
   return files;
 }
 
-// 推送后通过 API 把 JSON 数据页的内容模型设为 json（幂等，跳过已是 json 的页）
-async function ensureJsonContentModels() {
+// MediaWiki 命名空间下需要专用内容模型的脚本页（MediaWiki:Common.js、MediaWiki:Gadget-*.js 等）
+function listScriptContentModelTargets() {
+  const out = [];
+  for (const ent of fs.readdirSync(REPO_DIR, { withFileTypes: true })) {
+    if (!ent.isFile() || !ent.name.endsWith('.mw')) continue;
+    let title;
+    try { title = decodeURIComponent(ent.name.slice(0, -3)); } catch (e) { continue; }
+    if (!title.startsWith('MediaWiki:')) continue;
+    if (title.endsWith('.js')) out.push({ title, model: 'javascript' });
+    else if (title.endsWith('.css')) out.push({ title, model: 'css' });
+  }
+  return out;
+}
+
+// 推送后通过 API 修正内容模型（幂等，跳过模型已正确的页）
+async function ensureContentModels() {
   console.log('');
-  console.log('===== 确保 JSON 数据页内容模型 =====');
-  const titles = listJsonDataFiles();
-  if (!titles.length) {
-    console.log('（无 JSON 数据页，跳过）');
+  console.log('===== 确保内容模型（MediaWiki 脚本页 / JSON 数据页）=====');
+  const targets = listScriptContentModelTargets();
+  if (cfg.jsonContentModels) {
+    for (const title of listJsonDataFiles()) {
+      targets.push({ title, model: 'json' });
+    }
+  }
+  if (!targets.length) {
+    console.log('（无需修正的页面，跳过）');
     return;
   }
   const user = execSync(
@@ -797,24 +816,24 @@ async function ensureJsonContentModels() {
     const ct = await q({ action: 'query', meta: 'tokens', type: 'csrf' });
     const csrf = ct.query.tokens.csrftoken;
 
-    for (const title of titles) {
+    for (const { title, model } of targets) {
       const info = await q({ action: 'query', titles: title, prop: 'info' });
       const pg = Object.values(info.query.pages)[0];
       if (!pg || pg.missing) {
         console.log(`  ⚠️ ${title} 线上不存在`);
         continue;
       }
-      if (pg.contentmodel === 'json') {
-        console.log(`  ✓ ${title} 已是 json`);
+      if (pg.contentmodel === model) {
+        console.log(`  ✓ ${title} 已是 ${model}`);
         continue;
       }
       const r = await post({
-        action: 'changecontentmodel', title, model: 'json', token: csrf,
+        action: 'changecontentmodel', title, model, token: csrf,
       });
       if (r.error) {
-        console.log(`  ✗ ${title} -> json 失败: ${r.error.info}`);
+        console.log(`  ✗ ${title} -> ${model} 失败: ${r.error.info}`);
       } else {
-        console.log(`  ✓ ${title} -> json`);
+        console.log(`  ✓ ${title} -> ${model}`);
       }
     }
   } catch (e) {

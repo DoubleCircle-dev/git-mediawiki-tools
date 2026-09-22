@@ -14,7 +14,8 @@
     "mw-publish": "bin/publish.js",
     "mw-set-pass": "bin/set-pass.js",
     "mw-content-sync": "bin/content-sync.js",
-    "mw-preview": "bin/preview.js"
+    "mw-preview": "bin/preview.js",
+    "mw-upload-media": "bin/upload-media.js"
   },
   "engines": {
     "node": ">=16"
@@ -37,6 +38,7 @@
     "preview:watch": "node bin/preview.js watch",
     "preview:stop": "node bin/preview.js stop",
     "preview:squash": "node bin/preview.js squash",
+    "upload-media": "node bin/upload-media.js",
     "open-conflicts": "bash tools/open-conflicts.sh"
   }
 }

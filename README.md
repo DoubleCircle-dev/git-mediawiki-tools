@@ -9,6 +9,7 @@
 - **Git 原生冲突处理**：当 content/ 与扁平仓库分别修改同一页面时，工具将冲突写入 Git 索引并标记为 `UU`，禁止静默覆盖；用户可使用 VS Code 内置合并编辑器处理冲突。
 - **多远程支持**：同一 Wiki 可配置多个远程端点，并按照指定顺序推送和对齐修订号，以降低 `non-fast-forward` 错误风险。
 - **JSON 数据页支持**：可在发布后将内容为合法 JSON 的 `.mw` 页面修正为 `json` 内容模型，使 `/Data` 等数据页面按数据视图展示。
+- **媒体批量上传**：`upload-media` 按 SHA1 比对远端同名文件，只上传缺失或不一致者；用于规避 git-remote-mediawiki 在本机 Perl 下推送媒体崩溃（`HTTP::Message content must be bytes`）的问题，Git 侧只负责页面。
 - **零第三方依赖**：仅使用 Node.js 内置模块，无需执行 `npm install`。
 
 ## 前置依赖
@@ -73,7 +74,7 @@ node bin/sync.js
 | `defaultUser` | — | `set-pass` 默认用户名 |
 | `jsonContentModels` | `false` | 发布后把合法 JSON 的 `.mw` 页设为 json 内容模型 |
 | `timeoutMs` | `180000` | git 操作的硬超时 |
-| `preview` | — | 本地预览配置段（`mediawikiDir`/`port`/`dbFile`/`adminUser` 等），见「本地预览(可选)」 |
+| `preview` | — | 本地预览配置段（`mediawikiDir`/`imagesDir`/`port`/`dbFile`/`adminUser` 等），见「本地预览(可选)」 |
 
 > 命名空间里 `_` 是 MediaWiki 内部写法（如 `User_talk`）；若你的 `Project` 命名空间有本地化名（例如 `久远澪Wiki`），请把该本地名也加入。
 
@@ -94,9 +95,10 @@ node bin/sync.js
 | `node bin/content-sync.js git-merge` | 将冲突写入 Git 索引并标记为 `UU`，供 VS Code 源代码管理面板和合并编辑器处理；`--abort` 用于撤销本次操作。检测到冲突时通常已自动执行该步骤。 |
 | `npm run open-conflicts` | 逐项打开冲突文件；默认直接在 VS Code 中打开，`--mode diff` 用于打开两窗格差异视图。每处理完一项后按回车继续。 |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
+| `node bin/upload-media.js [文件\|媒体名 …]` | 把本地媒体批量上传到远端：默认扫描 `content/images` 并与远端同名文件比对 SHA1，只上传缺失或不一致者；`--all` 忽略差异全部重传、`--dry-run` 只列清单、`--flat` 改为扫描扁平仓库根目录。凭据取扁平仓库 `remote.<remote>.mwlogin / mwpassword`，地址与目录读 `config.json`。 |
 | `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史与图片归档 |
 
-执行 `npm link` 后，也可使用全局命令 `mw-publish`、`mw-sync`、`mw-content-sync` 和 `mw-preview`。
+执行 `npm link` 后，也可使用全局命令 `mw-publish`、`mw-sync`、`mw-content-sync`、`mw-preview` 和 `mw-upload-media`。
 
 ## 内容树约定
 

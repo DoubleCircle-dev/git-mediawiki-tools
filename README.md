@@ -94,7 +94,7 @@ node bin/sync.js
 | `node bin/content-sync.js git-merge` | 将冲突写入 Git 索引并标记为 `UU`，供 VS Code 源代码管理面板和合并编辑器处理；`--abort` 用于撤销本次操作。检测到冲突时通常已自动执行该步骤。 |
 | `npm run open-conflicts` | 逐项打开冲突文件；默认直接在 VS Code 中打开，`--mode diff` 用于打开两窗格差异视图。每处理完一项后按回车继续。 |
 | `node bin/content-sync.js dedupe-images` | 内容树图片与扁平仓库硬链接去重 |
-| `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史 |
+| `node bin/preview.js start\|stop\|squash` | 本地预览（可选）：起停 php + 监听导入 / 退出精简历史与图片归档 |
 
 执行 `npm link` 后，也可使用全局命令 `mw-publish`、`mw-sync`、`mw-content-sync` 和 `mw-preview`。
 
@@ -215,15 +215,15 @@ Node.js 版预览模块 `bin/preview.js`；MediaWiki 本体仍由 PHP 运行，N
 6. **克隆本地仓库（可选，用于本地 Wiki 编辑测试）**：`git clone "mediawiki::http://127.0.0.1:8080/" wiki.mywiki`，并在 `.git/config` 中配置凭据和命名空间。
 
 ```bash
-# 需在 config.json 配置 preview.*（mediawikiDir / dbFile 等）
+# 需在 config.json 配置 preview.*（mediawikiDir / dbFile / imagesDir 等）
 # 在仓库根目录执行以下 npm scripts：
 npm run preview:start    # 等同 node bin/preview.js start
 npm run preview:stop     # 等同 node bin/preview.js stop
 
 # 也可以直接调用以下命令：
-node bin/preview.js start    # 启动 php -S + 文件监听（前台；Ctrl+C 退出自动精简历史）
-node bin/preview.js stop     # 停止并精简本地历史
-node bin/preview.js squash   # 仅精简本地 DB 历史（保留每页最新）
+node bin/preview.js start    # 启动 php -S + 文件监听（前台；Ctrl+C 退出自动精简历史与图片归档）
+node bin/preview.js stop     # 停止并精简本地历史与图片归档
+node bin/preview.js squash   # 仅精简本地 DB 历史（保留每页最新）与图片归档
 node bin/preview.js import <file>...  # 一次性导入指定 .mw / 图片
 ```
 
@@ -231,7 +231,11 @@ node bin/preview.js import <file>...  # 一次性导入指定 .mw / 图片
 - **服务启动**：使用 `php -S` 和 SQLite；将 `$wgParserCacheType` 设置为 `CACHE_NONE`，确保每次请求均使用最新内容进行渲染。
 - **内容导入**：通过包含「`title<TAB>路径`」的清单执行 `maintenance/importPagesManifest.php`。内容未发生变化时自动跳过，操作具有幂等性。
 - **文件监听**：对 `content/` 进行约 1 秒一次的轮询并记录 mtime 快照；扁平仓库发生 `fs.watch` 变更时立即导入。保存 `content/` 中的 `.mw` 文件后会回写扁平仓库工作树，但不会自动提交；发生冲突时跳过回写。图片仅参与预览。
-- **退出时精简历史**：本地数据库是可由 `content/` 重建的镜像。退出时将每页历史精简为最新 revision 并执行 VACUUM；SQLite 清理由 Node.js 调用 PHP 完成，不引入额外依赖。
+- **退出时精简历史与图片归档**：本地数据库与上传目录均为可由 `content/` 重建的镜像。退出时将每页历史
+  精简为最新 revision、清空 `oldimage` 记录与 `images/archive/` 下的旧版图片文件，并执行 VACUUM；SQLite 清理由
+  Node.js 调用 PHP 完成，不引入额外依赖。`importImages.php --overwrite` 会将被覆盖的旧图写入 `images/archive/`
+  而不登记 `oldimage` 记录，因此每次启动对齐都可能产生孤儿文件，需在退出时清理。上传目录默认取
+  `<mediawikiDir>/images`，也可由 `preview.imagesDir` 指定。
 - **缓存刷新**：修改 TemplateStyles 或 Common.css 后，浏览器可能继续使用旧样式。由于 site.styles 的 load.php URL 不包含版本参数，解析缓存还需要执行 purge；验证时可绕过缓存读取最新 CSS。
 
 ## 进阶

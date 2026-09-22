@@ -3,14 +3,14 @@
  * git-mediawiki-tools 预览模块（Node 版，可选）
  *
  * 在本地起一套 MediaWiki（php -S + SQLite）并把扁平仓库 / content/ 的页面导入，
- * 保存即刷新查看渲染；退出时自动精简本地版本历史。MediaWiki 本体必须由 PHP 运行，
+ * 保存即刷新查看渲染；退出时自动精简本地版本历史与图片归档。MediaWiki 本体必须由 PHP 运行，
  * 本脚本用 Node 负责：启停 php 子进程、监听文件、批量导入、content→扁平回写、退出精简。
  *
  * 子命令：
  *   node bin/preview.js start           启动 php -S + 文件监听（前台运行；Ctrl+C 退出自动精简）
  *   node bin/preview.js watch           仅启动文件监听（需外部已起 php -S）
- *   node bin/preview.js stop            停止监听与 php，并精简历史
- *   node bin/preview.js squash          仅精简本地 DB 历史（保留每页最新）
+ *   node bin/preview.js stop            停止监听与 php，并精简历史与图片归档
+ *   node bin/preview.js squash          仅精简本地 DB 历史（保留每页最新）与图片归档
  *   node bin/preview.js import <f>...   一次性把给定 .mw / 图片导入预览
  *
  * 需要 config.json（或 GWMW_CONFIG）里配置 preview.*（见 config.example.json）。
@@ -32,6 +32,8 @@ const MW = P.mediawikiDir;
 const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'];
 const SCAN_MS = 1000;
 const PID_FILE = path.join(os.tmpdir(), 'gw-preview.pid');
+// 上传目录（含 archive 旧版图）；可用 preview.imagesDir 覆盖
+const IMAGES = P.imagesDir || (MW ? path.join(MW, 'images') : null);
 
 const isImage = (n) => IMAGE_EXTS.includes(path.extname(n).toLowerCase());
 
@@ -287,15 +289,53 @@ $arc = $p->exec('DELETE FROM archive');
 $p->exec('DELETE FROM slots WHERE slot_revision_id NOT IN (SELECT rev_id FROM revision)');
 $p->exec('DELETE FROM content WHERE content_id NOT IN (SELECT slot_content_id FROM slots) AND content_id NOT IN (SELECT slot_origin FROM slots)');
 $p->exec("DELETE FROM text WHERE old_id NOT IN (SELECT CAST(substr(content_address, 4) AS INTEGER) FROM content WHERE content_address LIKE 'tt:%')");
+$oi = $p->exec('DELETE FROM oldimage');
 $p->exec('COMMIT');
 $after = (int)$p->query('SELECT count(*) FROM revision')->fetchColumn();
 $p->exec('VACUUM');
-echo "历史精简: revision $before -> $after, archive 清 $arc 条\n";
+echo "历史精简: revision $before -> $after, 删版本 $arc 条, oldimage 清 $oi 条\n";
 `;
 
+// 统计目录内文件数与字节数（不跟随符号链接的目录项）
+function dirStats(dir) {
+  let files = 0, bytes = 0;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      const s = dirStats(p);
+      files += s.files;
+      bytes += s.bytes;
+    } else if (e.isFile()) {
+      files += 1;
+      try { bytes += fs.statSync(p).size; } catch (err) { /* ignore */ }
+    }
+  }
+  return { files, bytes };
+}
+
+// 清空图片归档目录：importImages.php --overwrite 会把被覆盖的旧图丢进 images/archive，
+// 但 SQLite 并不登记对应的 oldimage 行 → 纯孤儿文件，每次启动对齐都会重新长出来。
+function purgeImageArchive() {
+  if (!IMAGES) {
+    console.log('  （无法确定上传目录，跳过图片归档清理；可配置 preview.imagesDir）');
+    return;
+  }
+  const dir = path.join(IMAGES, 'archive');
+  if (!fs.existsSync(dir)) return;
+  const { files, bytes } = dirStats(dir);
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.name.startsWith('.')) continue; // 保留 .htaccess 等隐藏文件
+    fs.rmSync(path.join(dir, e.name), { recursive: true, force: true });
+  }
+  if (files) {
+    console.log(`  图片归档: 清 ${files} 个旧版文件（${(bytes / 1048576).toFixed(1)} MB）`);
+  }
+}
+
 function squashDb() {
+  purgeImageArchive();
   if (!P.dbFile) {
-    console.log('  （未配置 preview.dbFile，跳过精简）');
+    console.log('  （未配置 preview.dbFile，跳过版本历史精简）');
     return;
   }
   if (!fs.existsSync(P.dbFile)) {
@@ -376,7 +416,7 @@ async function main() {
     try { spawnSync('pkill', ['-f', `php -S 127.0.0.1:${P.port}`]); } catch (e) { /* */ }
     try { fs.unlinkSync(PID_FILE); } catch (e) { /* */ }
     squashDb();
-    console.log('已停止预览（历史已精简）');
+    console.log('已停止预览（历史与图片归档已精简）');
   } else if (cmd === 'squash') squashDb();
   else if (cmd === 'import') {
     const files = process.argv.slice(3);

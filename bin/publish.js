@@ -19,9 +19,9 @@
  *   打印 "Ignoring media file …"），图片一律走 API；发布收尾会 best-effort 比对
  *   content/images 与远端并上传差异，失败只提示原因与重跑命令，不影响、也不回滚
  *   已经完成的页面推送（退出码不变）。
- *   删除语义：git-mediawiki 无法真正删网页，只能改写正文（wikitext 页写
- *   [[Category:Deleted]]；Scribunto/CSS/JS/JSON 页写同格式注释占位）——
- *   被删页面仍会在线上存在，发布末尾会提醒去线上真正删除。
+ *   删除语义：git-mediawiki 无法真正删网页，只能改写正文。如何改写由 config.json 的
+ *   deletion 段按「内容模型 → 处置模式」配置（helper / text / stub / none，见下与
+ *   README「页面删除」）——被删页面仍会在线上存在，发布末尾会提醒去线上真正删除。
  */
 'use strict';
 
@@ -40,22 +40,59 @@ const contentSync = require('./content-sync.js');
 
 // ---------------------------------------------------------------------------
 // 删除语义（git-mediawiki 无法真正删除页面，只能改写正文）
-//   - wikitext 页：helper 会把正文替换为 [[Category:Deleted]]（页面仍在 → 需线上真删）
-//   - 其它内容模型：Scribunto / sanitized-css / css / javascript / json 写 wikitext 会被
-//     各自的内容校验拒绝（helper 还会把该 API 错误误报成 non-fast-forward）
-//     → 改为「清空 + 同格式注释占位」，仍由管理员在线上真正删除
+//   处置模式由 config.json 的 deletion 段按内容模型配置（键 = API prop=info 的
+//   contentmodel：wikitext / Scribunto / sanitized-css / css / javascript / json …）：
+//     helper —— 不写占位，交给 git-mediawiki：它会按自己的 DELETED_CONTENT 常量把
+//               正文改写为 [[Category:Deleted]]（对非 wikitext 页会被内容校验拒绝）
+//     text   —— 把自定义正文（deletion.modes.<模型>.text）写进 content/，随发布上线；
+//               未配置文本时退回 helper。普通 wiki 页面（wikitext）常用这一模式，
+//               例如写本站的删除模板 {{需要删除}}
+//     stub   —— 清空为「该内容模型对应格式」的注释占位（见 STUB_CONTENT）
+//     none   —— 不改写，原样提交删除（服务端可能按内容模型拒绝）
+//   未列出的内容模型用 deletion.defaultMode（缺省 helper）。
 // ---------------------------------------------------------------------------
-const WIKITEXT_DELETED = '[[Category:Deleted]]';
+const HELPER_DELETED = '[[Category:Deleted]]';   // git-remote-mediawiki 的 DELETED_CONTENT 常量
+const DELETION_MODES = ['helper', 'text', 'stub', 'none'];
+const DEFAULT_STUB_NOTE = '本页已废弃：原内容已清空，请在线上删除本页。';
 const STUB_CONTENT = [
-  { models: ['Scribunto'],
-    text: `-- ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。\n` },
-  { models: ['sanitized-css', 'css', 'less'],
-    text: `/* ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。 */\n` },
-  { models: ['javascript'],
-    text: `// ${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。\n` },
-  { models: ['json'],
-    text: `{"_comment": "${WIKITEXT_DELETED} 本页已废弃：原内容已清空，请在线上删除本页。"}\n` },
+  { models: ['Scribunto'], text: (note) => `-- ${note}\n` },
+  { models: ['sanitized-css', 'css', 'less'], text: (note) => `/* ${note} */\n` },
+  { models: ['javascript'], text: (note) => `// ${note}\n` },
+  { models: ['json'], text: (note) => `{"_comment": ${JSON.stringify(note)}}\n` },
 ];
+
+// 该内容模型的「同格式注释占位」正文（无对应格式返回 null）
+function stubContentFor(model, note) {
+  const t = STUB_CONTENT.find((s) => s.models.includes(model));
+  return t ? t.text(note) : null;
+}
+
+// 解析某内容模型的删除处置：deletion.modes[模型]（模式名字符串或 { mode, text }）
+//   → { mode, text }；模式非法/缺省时用 deletion.defaultMode（缺省 helper）。
+//   mode=text 但没给文本时退回 helper：宁可让 helper 写 [[Category:Deleted]]，也不留空正文。
+function resolveDeletion(model) {
+  const d = cfg.deletion || {};
+  const spec = (d.modes || {})[model];
+  const obj = typeof spec === 'string' ? { mode: spec }
+    : (spec && typeof spec === 'object' ? spec : {});
+  let mode = DELETION_MODES.includes(obj.mode) ? obj.mode
+    : (DELETION_MODES.includes(d.defaultMode) ? d.defaultMode : 'helper');
+  const text = obj.text ? String(obj.text) : (typeof d.text === 'string' ? d.text : '');
+  if (mode === 'text' && !text.trim()) mode = 'helper';
+  return { mode, text };
+}
+
+// 正文末尾补一个换行（写进 content/ 时用）
+function withEol(s) {
+  const t = String(s);
+  return /\n$/.test(t) ? t : t + '\n';
+}
+
+// 单行摘要（日志里展示多行正文用）
+function oneLine(s) {
+  const t = String(s).replace(/\s+/g, ' ').trim();
+  return t.length > 60 ? t.slice(0, 60) + '…' : t;
+}
 
 // 扁平文件名 -> 页面标题（%2F -> /、_ -> 空格）
 function flatTitle(name) {
@@ -80,7 +117,7 @@ async function fetchContentModels(titles) {
         out.set(p.title.replace(/_/g, ' '), p.missing ? null : (p.contentmodel || undefined));
       }
     } catch (e) {
-      console.log(`   ⚠️ 查询内容模型失败（${e.message}），按 wikitext 处理`);
+      console.log(`   ⚠️ 查询内容模型失败（${e.message}）：这些页面按 deletion.defaultMode（缺省 helper）处理`);
     }
   }
   return out;
@@ -94,10 +131,13 @@ function askYesNo(question) {
   });
 }
 
-// 删除预检：列出待删页面并确认；对 git-mediawiki 删不掉的页面写“同格式占位”到 content/
-// （随本次发布上线）。返回 [{ name, title, model, stub }] 供发布末尾提醒。
+// 删除预检：列出待删页面并确认；再按 config.deletion 的「内容模型 → 模式」处置
+// git-mediawiki 删不掉的页面（把改写后的正文写进 content/，随本次发布上线）。
+// 返回 [{ name, title, model, mode, text, note }] 供发布末尾提醒。
 async function prepareDeletions(names, assumeYes) {
-  const plan = names.map((name) => ({ name, title: flatTitle(name), model: undefined, stub: null }));
+  const plan = names.map((name) => ({
+    name, title: flatTitle(name), model: '', mode: '', text: '', note: '',
+  }));
   console.log('');
   console.log(`⚠️ 待删除页面 ${plan.length} 个（content/ 中已不存在，扁平仓库仍跟踪）：`);
   for (const p of plan) console.log('   - ' + p.title);
@@ -108,7 +148,7 @@ async function prepareDeletions(names, assumeYes) {
       console.log('非交互终端无法确认：请加 --yes（或设 MW_PUBLISH_YES=1）明确同意后再发布。已中止。');
       process.exit(1);
     }
-    const ok = await askYesNo('确认按此处置（删除/清空占位）并随本次发布上线？[y/N] ');
+    const ok = await askYesNo('确认按上述处置（改写线上正文）并随本次发布上线？[y/N] ');
     if (!ok) {
       console.log('已取消发布（未改动任何文件）。');
       console.log('若这些页面只是没同步进 content/，请先执行 node bin/content-sync.js mirror 补回后重试。');
@@ -118,26 +158,58 @@ async function prepareDeletions(names, assumeYes) {
 
   const models = await fetchContentModels(plan.map((p) => p.title));
   const allMw = contentSync.listFlat(REPO_DIR).mw;
-  for (const p of plan) {
-    if (contentSync.isImage(p.name)) {
-      p.stub = 'image';
-      console.log(`   ↳ ${p.title}：二进制文件，需由管理员在线上删除（本次仅从本地移除）`);
-      continue;
-    }
-    const model = models.get(p.title);
-    p.model = model === null ? '(线上不存在)' : (model || 'wikitext');
-    if (p.model === '(线上不存在)' || p.model === 'wikitext') continue; // 走 helper 的 [[Category:Deleted]]
-    const stub = (STUB_CONTENT.find((s) => s.models.includes(p.model)) || {}).text;
-    if (!stub) {
-      console.log(`   ↳ ${p.title}：内容模型 ${p.model} 无对应占位格式，按原样提交（可能被服务端拒绝）`);
-      continue;
-    }
+  const note = (cfg.deletion && cfg.deletion.stubNote) || DEFAULT_STUB_NOTE;
+  // 把改写后的正文写进内容树（发布时随 flatten 上线）
+  const writeContent = (p, text, how) => {
     const rel = contentSync.mirrorRel(p.name, allMw);
     const dst = path.join(CONTENT_DIR, rel);
     fs.mkdirSync(path.dirname(dst), { recursive: true });
-    fs.writeFileSync(dst, stub);
-    p.stub = model;
-    console.log(`   ↳ ${p.title}（${model}）：无法由 git-mediawiki 删除 → 已清空为同格式占位（content/${rel}）`);
+    fs.writeFileSync(dst, text);
+    console.log(`   ↳ ${p.title}（${p.model}）：${how}（content/${rel}）`);
+  };
+
+  for (const p of plan) {
+    if (contentSync.isImage(p.name)) {
+      p.mode = 'image';
+      console.log(`   ↳ ${p.title}：二进制文件，需由管理员在线上删除（本次仅从本地移除）`);
+      continue;
+    }
+    if (!models.has(p.title)) {
+      // 内容模型未知（API 不可用 / 未配 apiUrl）：不猜格式，退回 helper 的默认改写
+      p.model = '(未知)';
+      p.mode = 'helper';
+      console.log(`   ↳ ${p.title}：内容模型未知（API 不可用？）→ 按 helper 处理（写 ${HELPER_DELETED}）`);
+      continue;
+    }
+    const model = models.get(p.title);
+    if (model === null) {
+      p.model = '(线上不存在)';
+      p.mode = 'skip';
+      console.log(`   ↳ ${p.title}：线上不存在，无需处置`);
+      continue;
+    }
+    p.model = model;
+    const { mode, text } = resolveDeletion(model);
+    p.mode = mode;
+    p.text = text;
+    if (mode === 'helper') {
+      console.log(`   ↳ ${p.title}（${model}）：交由 git-mediawiki 改写为 ${HELPER_DELETED}`);
+    } else if (mode === 'text') {
+      writeContent(p, withEol(text), '已改写为自定义正文');
+      console.log(`     正文：${oneLine(text)}`);
+    } else if (mode === 'stub') {
+      const stub = stubContentFor(model, note);
+      if (!stub) {
+        p.mode = 'none';
+        p.note = `内容模型 ${model} 无对应占位格式`;
+        console.log(`   ↳ ${p.title}：${p.note} → 按原样提交（可能被服务端拒绝）`);
+      } else {
+        writeContent(p, stub, `无法由 git-mediawiki 删除 → 已清空为 ${model} 同格式占位`);
+      }
+    } else {
+      p.note = 'deletion.modes 配置为 none';
+      console.log(`   ↳ ${p.title}（${model}）：按配置不改写，原样提交删除（服务端可能拒绝）`);
+    }
   }
   return plan;
 }
@@ -149,9 +221,13 @@ function reportDeletions(plan) {
   console.log('===== 需在线上真正删除的页面 =====');
   console.log('以下页面在 content/ 中已删除，本次发布只是改写了线上正文，页面本身仍然存在：');
   for (const p of plan) {
-    const how = p.stub === 'image' ? '二进制文件，已从本地移除（线上需管理员删除）'
-      : p.stub ? `已清空为 ${p.stub} 同格式占位注释`
-        : `已替换为 ${WIKITEXT_DELETED}`;
+    let how;
+    if (p.mode === 'image') how = '二进制文件，已从本地移除（线上需管理员删除）';
+    else if (p.mode === 'text') how = `已改写为自定义正文「${oneLine(p.text)}」`;
+    else if (p.mode === 'stub') how = `已清空为 ${p.model} 同格式占位注释`;
+    else if (p.mode === 'helper') how = `交由 git-mediawiki 改写为 ${HELPER_DELETED}`;
+    else if (p.mode === 'none') how = `未改写（${p.note || '按配置'}）`;
+    else how = `未处置（${p.model || '线上不存在'}）`;
     console.log(`   - ${p.title}（${how}）`);
   }
   console.log('请在 wiki 上用 Special:Delete 或 API action=delete 真正删除这些页面，然后本地按需收尾：');
@@ -525,7 +601,7 @@ async function main() {
     }
     if (pub.written) console.log(`已将 ${pub.written} 个内容树改动回写扁平仓库`);
     if (pub.deletion.length) {
-      console.log(`⚠️ 已按确认把 ${pub.deletion.length} 个页面从扁平仓库移除（线上将被改写为占位）：`);
+      console.log(`⚠️ 已按确认把 ${pub.deletion.length} 个页面从扁平仓库移除（未写占位，线上正文由 git-mediawiki 改写）：`);
       for (const n of pub.deletion) console.log('   - ' + n);
     }
     if (!pub.written && !pub.deletion.length) console.log('（无内容树改动）');
@@ -888,5 +964,5 @@ module.exports = {
   main, prepareDeletions, reportDeletions, flatTitle, fetchContentModels,
   resolveRemotes, syncRemote, parseImportedRevisions, reportRemoteRace,
   preflightRemote, siteFingerprint, compareFingerprints, verifySameBackend,
-  STUB_CONTENT, WIKITEXT_DELETED,
+  STUB_CONTENT, DELETION_MODES, HELPER_DELETED, resolveDeletion, stubContentFor,
 };

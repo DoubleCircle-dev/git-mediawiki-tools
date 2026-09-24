@@ -9,6 +9,7 @@
 - **Git 原生冲突处理**：当 content/ 与扁平仓库分别修改同一页面时，工具将冲突写入 Git 索引并标记为 `UU`，禁止静默覆盖；用户可使用 VS Code 内置合并编辑器处理冲突。
 - **多远程支持**：同一 Wiki 可配置多个远程端点，并按照指定顺序推送和对齐修订号，以降低 `non-fast-forward` 错误风险。
 - **JSON 数据页支持**：可在发布后将内容为合法 JSON 的 `.mw` 页面修正为 `json` 内容模型，使 `/Data` 等数据页面按数据视图展示。
+- **删除页面处置（按内容模型配置）**：删除 `content/` 中的页面后，`publish` 会列出待删清单并确认，再按 `config.json` 的 `deletion.modes.<内容模型>` 决定如何改写线上正文（git-mediawiki 无法真正删页）：`helper` 交给 git-mediawiki（wikitext → `[[Category:Deleted]]`）、`text` 写入自定义正文（普通 wiki 页面可写本站删除模板，如 `{{需要删除}}`）、`stub` 清空为同格式注释占位、`none` 不改写。
 - **媒体批量上传**：`upload-media` 按 SHA1 比对远端同名文件，只上传缺失或不一致者；用于规避 git-remote-mediawiki 在本机 Perl 下推送媒体崩溃（`HTTP::Message content must be bytes`）的问题，Git 侧只负责页面。`publish` 收尾也会自动执行一次（best-effort，失败不影响页面推送）。超过 10MB 的文件失败时才提示先压缩（附 ffmpeg 命令）；未超 10MB 的失败会自动忽略警告重试一次。
 - **零第三方依赖**：仅使用 Node.js 内置模块，无需执行 `npm install`。
 
@@ -73,6 +74,7 @@ node bin/sync.js
 | `namespaces` | 标准集 | 纳入管理的命名空间（不含主命名空间与 File 图片） |
 | `defaultUser` | — | `set-pass` 默认用户名 |
 | `jsonContentModels` | `false` | 发布后把合法 JSON 的 `.mw` 页设为 json 内容模型 |
+| `deletion` | 见下 | 删除页面的处置：`{ defaultMode, text, stubNote, modes }`；`modes` 按内容模型（`wikitext` / `Scribunto` / `sanitized-css` / `css` / `javascript` / `json` …）配置 `helper` / `text` / `stub` / `none`，见「页面删除」 |
 | `uploadMedia` | `true` | 发布收尾是否自动上传媒体差异（best-effort；失败只提示，不影响页面推送） |
 | `timeoutMs` | `180000` | git 操作的硬超时 |
 | `preview` | — | 本地预览配置段（`mediawikiDir`/`imagesDir`/`port`/`dbFile`/`adminUser` 等），见「本地预览(可选)」 |
@@ -83,7 +85,7 @@ node bin/sync.js
 
 | 命令 | 作用 |
 |------|------|
-| `node bin/publish.js "说明"` | 提交本地变更并推送。命令行中附加的远程名参数将被忽略，工具始终按照 `pushOrder` 推送；可使用 `MW_PUSH_ORDER=origin` 临时覆盖推送顺序；`--yes` 用于跳过待删除页面确认。推送完成后会 best-effort 上传 `content/images` 里缺失/不一致的媒体（媒体本不随 push 上线：扁平仓库设 `mediaexport=false`）；媒体失败只提示原因与重跑命令，不影响、也不回滚已完成的页面推送。`--no-media`（或 `MW_NO_MEDIA=1`、`config.uploadMedia=false`）可跳过这一步。 |
+| `node bin/publish.js "说明"` | 提交本地变更并推送。命令行中附加的远程名参数将被忽略，工具始终按照 `pushOrder` 推送；可使用 `MW_PUSH_ORDER=origin` 临时覆盖推送顺序；`--yes` 用于跳过待删除页面确认（删除页面的正文改写方式取 `config.json` 的 `deletion`，见「页面删除」）。推送完成后会 best-effort 上传 `content/images` 里缺失/不一致的媒体（媒体本不随 push 上线：扁平仓库设 `mediaexport=false`）；媒体失败只提示原因与重跑命令，不影响、也不回滚已完成的页面推送。`--no-media`（或 `MW_NO_MEDIA=1`、`config.uploadMedia=false`）可跳过这一步。 |
 | `node bin/sync.js [远程]` | 拉取远程变更、执行变基并整理到 content/；未指定远程时使用主远程。 |
 | `node bin/set-pass.js [用户]` | 配置登录凭据，写入 `remote.<remote>.mwlogin` 和 `mwpassword`。 |
 | `node bin/content-sync.js status` | 查看扁平仓库与内容树之间的差异；`!` 表示存在冲突。 |
@@ -318,7 +320,26 @@ KEEP_TEST_SANDBOX=1 npm test    # 失败时保留沙盒现场（打印路径）
 - **推送被拒 `non-fast-forward`**：说明远程包含本地尚未获取的修订。应先执行 `node bin/sync.js`；如果本地 notes 中的修订号落后于远程实际修订号（例如站点直接编辑造成 recentchanges 暂时滞后），应将本地 notes 更新为远程实际修订号后再次推送。
 - **受保护页面无法推送**：例如 `MediaWiki:Common.css` 等受保护页面可能不允许机器人账户修改，导致整体推送失败。应将该页面从推送历史中移除（可使用 `git rebase -i` 合并提交），并将样式修改迁移至 TemplateStyles 子页面。
 - **内容树冲突**：当 `content/` 与扁平仓库分别修改同一页面时，发布将中止并列出冲突。应在 VS Code 合并编辑器中处理该 Git 冲突，完成后重新执行相应命令。
-- **页面删除**：删除 `content/` 中的页面后，`publish` 将其列为待删除项目并请求确认（可使用 `--yes` 或 `MW_PUBLISH_YES=1` 跳过确认；**非交互终端必须显式确认**）。Git-Mediawiki **无法直接删除线上页面**，只能改写页面正文：wikitext 页面写入 `[[Category:Deleted]]`；Scribunto、sanitized-css、CSS、JS 和 JSON 页面因内容校验无法接受该文本，将自动改写为**对应格式的注释占位内容**（Lua `-- …`、CSS `/* … */`、JS `// …`、JSON `{"_comment": …}`）。发布结束时将提示用户通过线上 `Special:Delete` 或 API `action=delete` 执行实际删除。
+- **页面删除**：删除 `content/` 中的页面后，`publish` 会列出待删除清单并请求确认（`--yes` 或 `MW_PUBLISH_YES=1` 跳过确认；**非交互终端必须显式确认**）。Git-Mediawiki **无法直接删除线上页面**，只能改写页面正文；改写方式由 `config.json` 的 `deletion` 段按**内容模型**配置：
+  - `helper`：不写占位，交给 git-mediawiki 按它自己的 `DELETED_CONTENT` 常量改写（wikitext → `[[Category:Deleted]]`；非 wikitext 页会被内容校验拒绝，还可能被误报为 `non-fast-forward`）；
+  - `text`：把 `modes.<模型>.text`（或全局 `deletion.text`）里的自定义正文写进 `content/`，随本次发布上线；未配置文本时自动退回 `helper`；
+  - `stub`：清空为**该模型对应格式**的注释占位（Lua `-- …`、CSS `/* … */`、JS `// …`、JSON `{"_comment": …}`；文案取 `deletion.stubNote`）；
+  - `none`：不改写，原样提交删除（服务端可能拒绝）。
+
+  未列在 `modes` 里的内容模型用 `defaultMode`（缺省 `helper`）。内容模型由 `prop=info` 读取，因此需要 `apiUrl` 可用；读不到模型时保守退回 `helper`，不会猜格式写正文。例如让普通 wiki 页面写本站删除模板：
+
+```json
+"deletion": {
+  "defaultMode": "helper",
+  "modes": {
+    "wikitext": { "mode": "text", "text": "{{需要删除}}" },
+    "Scribunto": "stub", "sanitized-css": "stub", "css": "stub",
+    "javascript": "stub", "json": "stub"
+  }
+}
+```
+
+  写入的正文会随发布上线（页面会被加入维护分类，如 `Category:需要删除`），但发布结束时仍会提示用户通过线上 `Special:Delete` 或 API `action=delete` 执行实际删除。
 - **新增命名空间后旧页面被跳过**：修改命名空间配置后，需要执行完整重新导入（删除 notes 并重新 clone），否则旧页面可能因全局修订号判断而被跳过。
 
 ## 许可

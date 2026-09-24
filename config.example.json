@@ -20,6 +20,20 @@
   ],
   "defaultUser": "",
   "jsonContentModels": false,
+  "_删除页面": "publish 遇到「content/ 已删除、扁平仓库仍跟踪」的页面时，按内容模型（API contentmodel）决定怎么改写线上正文（git-mediawiki 无法真正删页）：helper=交给它写 [[Category:Deleted]]；text=写 modes.<模型>.text 里的自定义正文；stub=清空为同格式注释占位；none=不改写。未列出的模型用 defaultMode。普通 wiki 页面想写本站删除模板，就配 \"wikitext\": { \"mode\": \"text\", \"text\": \"{{需要删除}}\" }。",
+  "deletion": {
+    "defaultMode": "helper",
+    "text": "",
+    "stubNote": "本页已废弃：原内容已清空，请在线上删除本页。",
+    "modes": {
+      "Scribunto": "stub",
+      "sanitized-css": "stub",
+      "css": "stub",
+      "less": "stub",
+      "javascript": "stub",
+      "json": "stub"
+    }
+  },
   "_媒体上传": "publish 收尾会 best-effort 比对 content/images 与远端并上传差异（媒体不随 push 上线）；false 可关闭，也可用 --no-media / MW_NO_MEDIA=1 单次跳过。失败不影响页面推送；超过 10MB 的失败才提示先压缩，其余失败会自动忽略警告重试一次。",
   "uploadMedia": true,
   "timeoutMs": 180000,
